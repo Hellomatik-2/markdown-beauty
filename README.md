@@ -1,80 +1,72 @@
 # Markdown Beauty
 
-Visor de Markdown para macOS con estética Notion, construido **solo con componentes de Hellomatik UI** (prioridad `custom-components` → `components-base` → gap-fillers de `apps/web`). App nativa Tauri 2 (~10 MB, arranque instantáneo) registrada como visor por defecto de `.md`.
+Plataforma nativa de Markdown para macOS con estética Notion, construida **solo con componentes de Hellomatik UI**. App Tauri 2 (~10 MB), registrada como visor por defecto de `.md`, con edición WYSIWYG, autoguardado y un **agente Claude Code real** embebido que solo conoce tus documentos abiertos.
 
-## Qué renderiza
+## Qué hace
 
-| Elemento markdown | Componente |
+| Área | Detalle |
 |---|---|
-| Tablas GFM | `Table` + `TableCard` (react-aria) |
-| Bloques de código | `CodeSnippet` custom (shiki full bundle, copiar, line numbers, show more) |
-| Callouts `> [!NOTE]`… | `Callout` sobre `Surface` custom |
-| Checkboxes de tareas | `Checkbox` UU |
-| Toolbar | `ButtonUtility` + `Button` UU |
-| Vacío | `HellomatikIcon` custom |
-
-Títulos en **Hedvig Letters Serif** (regla `hellomatik-mode` de theme.css; replicada para dark). Modo claro = lienzo crema cálido `hellomatik-mode`; modo oscuro = `dark-mode`. TOC lateral animado con scroll-spy, **pestañas tipo navegador** (sesión restaurable, dedupe, scroll por pestaña), navegación entre `.md` relativos, imágenes relativas vía protocolo `asset:`, recarga al recuperar foco, drag & drop, impresión limpia (`@media print`).
-
-## Markdown al máximo
-
-- **Exportar PDF directo** (botón Download): NSPrintOperation nativa sobre el WKWebView con `jobDisposition=save` — PDF vectorial paginado con los estilos print, sin diálogo de impresión. GOTCHA: esperar ~700 ms tras cerrar el save dialog (sheet) antes de lanzar la operación modal en la misma ventana; el print CSS DEBE deshacer la cadena `h-full`/`overflow:hidden` o solo sale 1 página.
-- **Búsqueda Cmd+F**: `SearchInput` del kit + `<mark>` pintados sobre los text nodes (fuera de React), contador n/m, Enter/Shift+Enter, Esc.
-- **Mermaid** (```mermaid → SVG, import lazy, tema claro/oscuro vía MutationObserver)
-- **KaTeX** ($…$ y $$…$$), **frontmatter YAML** como propiedades estilo Notion (Badges para arrays), **emojis** `:rocket:`
-- Empty state con el wordmark `HellomatikLogo` (Hedvig, el del login de la plataforma)
-
-## Hooks de automatización
-
-```bash
-MB_OPEN=/ruta/doc.md MB_EXPORT_PDF=/ruta/salida.pdf "/Applications/Markdown Beauty.app/Contents/MacOS/markdown-beauty"
-# abre el doc y exporta el PDF a los 6s — para tests/scripts
-```
-
-## ⚠ TCC tras cada reinstalación
-
-Cada rebuild cambia la firma ad-hoc (CDHash) y **macOS puede denegar EN SILENCIO el acceso a Escritorio/Documentos** (la app abre vacía al hacer doble click en un .md de esas carpetas). Tras instalar una build nueva:
-
-```bash
-tccutil reset SystemPolicyDesktopFolder com.hellomatik.markdown-beauty
-tccutil reset SystemPolicyDocumentsFolder com.hellomatik.markdown-beauty
-tccutil reset SystemPolicyDownloadsFolder com.hellomatik.markdown-beauty
-```
+| **Visor** | Render editorial (Hedvig Letters Serif en títulos), GFM, callouts, tablas, KaTeX, Mermaid, Shiki, notas al pie, frontmatter como propiedades Notion. TOC lateral con scroll-spy. |
+| **Pestañas** | Tipo navegador: sesión restaurable, dedupe, scroll por pestaña, Ctrl(+Shift)+Tab para ciclar. |
+| **Abrir** | ⌘O acepta archivos **y carpetas** (estilo VS Code: todos los `.md` de la carpeta en pestañas). Arrastrar archivos o carpetas a la ventana. Asociación de Finder. |
+| **Edición** | ⌘E o el lápiz: WYSIWYG sobre el render (BlockNote) con asideros por bloque y menú `/` en español. **Autoguardado** (1,2 s tras cada cambio, y al salir/cambiar pestaña/cerrar). El frontmatter se preserva intacto. |
+| **Export** | PDF directo (sin diálogo de impresión) fiel al tema activo: en oscuro, la hoja entera va oscura (composición CoreGraphics, vectorial). ⌘P imprime limpio. |
+| **Agente** | Panel derecho con **Claude Code interactivo de verdad** (ttyd + xterm.js): su TUI, su selector `/`, sus permisos. Sandboxeado: su único ámbito son los documentos abiertos (archivo o carpeta), siempre en su última versión autoguardada. |
+| **Tema** | Claro (crema cálido) / oscuro / **sistema** (sigue macOS en vivo). El icono del Dock también cambia con la apariencia. |
 
 ## Desarrollo
 
 ```bash
 npm install
-npm run dev          # navegador (modo preview, carga /sample.md)
-npx tauri dev        # app nativa
+npm run dev          # vite (preview en navegador, terminal en modo demo)
+npm run tauri dev    # app nativa de desarrollo
 ```
 
-## Build e instalación
+## Release
 
 ```bash
-RUSTFLAGS="-C link-arg=-Wl,-ld_classic" npx tauri build
-rm -rf "/Applications/Markdown Beauty.app"
-ditto "src-tauri/target/release/bundle/macos/Markdown Beauty.app" "/Applications/Markdown Beauty.app"
+npm run build:app    # == ./scripts/build-release.sh
 ```
 
-> ⚠ `ld_classic` es necesario en macOS beta (Darwin 27): el linker nuevo emite
-> dylibs de proc-macros con "mis-aligned LINKEDIT string pool" que dyld rechaza.
-> También está en `src-tauri/.cargo/config.toml` para builds directos de cargo.
-> El crate `time` está pineado a 0.3.47 (0.3.48 rompe con E0119).
+El script produce un build **agnóstico** (cero rutas/usuario de la máquina en el binario, con verificación que falla si no) y sortea los problemas del macOS beta. Ingredientes — todos necesarios, ver comentarios del script:
 
-## Asociación .md por defecto
-
-En esta beta de macOS `duti` y `LSSetDefaultRoleHandlerForContentType` devuelven éxito sin aplicar. Lo que funciona:
-
-```bash
-defaults write com.apple.LaunchServices/com.apple.launchservices.secure LSHandlers -array-add \
-  '{LSHandlerContentType = "net.daringfireball.markdown"; LSHandlerRoleAll = "com.hellomatik.markdown-beauty"; LSHandlerPreferredVersions = { LSHandlerRoleAll = "-"; }; }'
-killall lsd
-```
+1. cargo **directo** con `ld_classic` en env (tauri-cli pisa `RUSTFLAGS` y dyld rechaza los proc-macros: *mis-aligned LINKEDIT string pool*, que se manifiesta como `E0463 can't find crate`).
+2. `--remap-path-prefix` de `~/.cargo` y `src` — **nunca** del proyecto entero (cubriría `target/` y rompe la resolución de proc-macros).
+3. Symlink neutro `/tmp/mb-build` (el `CARGO_MANIFEST_DIR` que tauri incrusta vía `env!` es inmune al remap).
+4. `--features tauri/custom-protocol` (sin ella el binario busca el dev server y la webview sale en blanco).
+5. Empaquetado con `npx tauri bundle` (no recompila). Jamás parchear el binario a posteriori: rompe la app.
 
 ## Arquitectura
 
-- `vendor/hellomatik-ui/` — copia del kit (custom-components, components-base, `_lib/icons` como dep `@hm/icons`)
-- `vite.config.ts` — resolver con cadena de prioridad para `@/components/*`: `src/` → `custom-components/` → `components-base/`; shims `next/image` y `shiki/bundle/web → shiki` (bundle completo)
-- `src/components/` — gap-fillers que el kit referencia pero no incluye (checkbox, badges, button-utility, close-button, dot-icon, shim utility-button)
-- `src/markdown/` — renderer (react-markdown + remark-gfm + rehype-raw) con mapeos a componentes del kit
-- `src-tauri/` — comandos `read_markdown`/`get_opened_file`, `RunEvent::Opened` para la asociación de archivos
+```
+src/
+  App.tsx                 # shell: pestañas, tema, atajos, autosave, paneles
+  markdown/               # renderer (react-markdown + plugins), editor (BlockNote),
+                          #   búsqueda ⌘F, frontmatter
+  chat/chat-panel.tsx     # iframe a la terminal ttyd (Claude Code interactivo)
+  components/, styles/    # gap-fillers de Hellomatik UI + theme/typography
+src-tauri/
+  src/lib.rs              # comandos: read/write_markdown (atómico), export_pdf
+                          #   (NSPrintOperation + composición dark), expand/pick
+                          #   (NSOpenPanel archivos+carpetas), ttyd sidecar,
+                          #   chat_set_doc (ámbito del agente), set_dock_icon
+  vendor/ttyd/            # ttyd + dylibs @loader_path (bundle.resources)
+  icons/                  # icono claro/oscuro (transparencia real, grid Apple)
+scripts/build-release.sh  # pipeline agnóstico de release
+vendor/hellomatik-ui/     # kit vendoreado (@hm/icons como dep file:)
+```
+
+### El agente del documento
+
+- `ttyd` (puerto dinámico 7693+, solo loopback, muere con la app) ejecuta por sesión un wrapper zsh → `claude --append-system-prompt-file <prompt>`.
+- `chat_set_doc` regenera con cada autosave/pestaña: copia de **todos** los documentos abiertos al workspace (`~/Library/Application Support/com.hellomatik.markdown-beauty/chat/workspace`), el activo embebido completo en el prompt, el resto listados para su `Read`.
+- Cada documento conserva su terminal viva entre cambios de pestaña (iframes persistentes); ↻ arranca sesión nueva con el ámbito al día.
+- Requiere Claude Code instalado y con sesión iniciada (`claude` se resuelve vía login shell — la app de Finder no hereda el PATH).
+
+## Troubleshooting (macOS beta / Tahoe)
+
+- **Abro un .md y la app sale vacía**: TCC deniega Desktop/Documents en silencio tras cada reinstalación ad-hoc (cambia el CDHash). `tccutil reset SystemPolicy{Desktop,Documents,Downloads}Folder com.hellomatik.markdown-beauty` y acepta el aviso.
+- **Asociación por defecto**: `duti` devuelve éxito falso; lo que funciona es `defaults write com.apple.LaunchServices/com.apple.launchservices.secure LSHandlers -array-add '{LSHandlerContentType = "net.daringfireball.markdown"; LSHandlerRoleAll = "com.hellomatik.markdown-beauty"; }'` + `killall lsd`.
+- **Proc-macros que no compilan** tras tocar flags: borra el dylib envenenado en `target/release/deps` (o `cargo clean`) y usa `npm run build:app`.
+- **Icono raro en el Dock**: caché — `killall Dock`, o desancla y vuelve a anclar.
+- La primera vez, Claude pedirá **confiar en su carpeta de trabajo** (flujo normal de Claude Code; una sola vez).
