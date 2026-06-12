@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, ChevronUp, Copy01, Download01, FolderClosed, LayoutLeft, Moon01, Plus, Printer, Sun, X as CloseX } from "@hm/icons";
+import { Check, ChevronDown, ChevronUp, Copy01, Download01, FolderClosed, LayoutLeft, Monitor01, Moon01, Plus, Printer, Sun, X as CloseX } from "@hm/icons";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -31,8 +31,27 @@ interface TocEntry {
 
 const TABS_KEY = "mb:tabs";
 const ACTIVE_KEY = "mb:active-tab";
-const DARK_KEY = "mb:dark";
+const THEME_KEY = "mb:theme";
+const LEGACY_DARK_KEY = "mb:dark";
 const MD_EXT = /\.(md|markdown|mdown|mkd|mdx)$/i;
+
+type ThemePref = "system" | "light" | "dark";
+
+const THEME_CYCLE: Record<ThemePref, ThemePref> = { system: "light", light: "dark", dark: "system" };
+const THEME_META: Record<ThemePref, { icon: typeof Sun; label: string }> = {
+    system: { icon: Monitor01, label: "Tema: sistema" },
+    light: { icon: Sun, label: "Tema: claro" },
+    dark: { icon: Moon01, label: "Tema: oscuro" },
+};
+
+function loadThemePref(): ThemePref {
+    const saved = localStorage.getItem(THEME_KEY);
+    if (saved === "light" || saved === "dark" || saved === "system") return saved;
+    // Migración desde el toggle binario antiguo (mb:dark)
+    const legacy = localStorage.getItem(LEGACY_DARK_KEY);
+    if (legacy != null) return legacy === "1" ? "dark" : "light";
+    return "system";
+}
 
 /** Fuera de Tauri (vite dev en navegador) la app entra en modo preview:
  *  carga /sample.md por fetch y desactiva las APIs nativas. */
@@ -53,10 +72,9 @@ export default function App() {
     const [activePath, setActivePath] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [sidebarOpen, setSidebarOpen] = useState(true);
-    const [dark, setDark] = useState(() => {
-        const saved = localStorage.getItem(DARK_KEY);
-        return saved != null ? saved === "1" : window.matchMedia("(prefers-color-scheme: dark)").matches;
-    });
+    const [themePref, setThemePref] = useState<ThemePref>(loadThemePref);
+    const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
+    const dark = themePref === "dark" || (themePref === "system" && systemDark);
     const [toc, setToc] = useState<TocEntry[]>([]);
     const [activeId, setActiveId] = useState<string | null>(null);
     const scrollRef = useRef<HTMLElement>(null);
@@ -193,13 +211,34 @@ export default function App() {
         if (activePath) localStorage.setItem(ACTIVE_KEY, activePath);
     }, [tabs, activePath]);
 
-    // ── Modo claro (hellomatik cálido) / oscuro ───────────────────────
+    // ── Tema: claro (hellomatik cálido) / oscuro / sistema ────────────
     useEffect(() => {
         const root = document.documentElement;
         root.classList.toggle("dark-mode", dark);
         root.classList.toggle("hellomatik-mode", !dark);
-        localStorage.setItem(DARK_KEY, dark ? "1" : "0");
     }, [dark]);
+
+    useEffect(() => {
+        localStorage.setItem(THEME_KEY, themePref);
+    }, [themePref]);
+
+    // Con preferencia "sistema", seguir los cambios de macOS en vivo
+    useEffect(() => {
+        const media = window.matchMedia("(prefers-color-scheme: dark)");
+        const onChange = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+        media.addEventListener("change", onChange);
+        return () => media.removeEventListener("change", onChange);
+    }, []);
+
+    // Hook de test: MB_THEME fuerza el tema al arrancar
+    useEffect(() => {
+        if (!IS_TAURI) return;
+        invoke<string | null>("get_startup_theme")
+            .then((t) => {
+                if (t === "dark" || t === "light" || t === "system") setThemePref(t);
+            })
+            .catch(() => {});
+    }, []);
 
     // ── Título de ventana ─────────────────────────────────────────────
     useEffect(() => {
@@ -275,10 +314,16 @@ export default function App() {
         if (!dest) return;
         setExportState("busy");
         try {
+            // El PDF hereda el tema activo. En oscuro el backend compone
+            // cada página sobre el color real del lienzo (la banda de
+            // márgenes de NSPrintInfo quedaría blanca si no).
+            const isDark = document.documentElement.classList.contains("dark-mode");
+            const canvas = getComputedStyle(document.body).backgroundColor.match(/\d+(\.\d+)?/g);
+            const pageRgb = canvas?.slice(0, 3).map((n) => Number(n) / 255) ?? [1, 1, 1];
             // El sheet del save dialog tiene que desmontarse del todo antes
             // de anclar la NSPrintOperation modal a la misma ventana.
             await new Promise((resolve) => setTimeout(resolve, 700));
-            await invoke("export_pdf", { dest });
+            await invoke("export_pdf", { dest, dark: isDark, pageRgb });
             setExportState("done");
             void revealItemInDir(dest).catch(() => {});
             setTimeout(() => setExportState("idle"), 2000);
@@ -404,9 +449,9 @@ export default function App() {
                     <ButtonUtility
                         size="xs"
                         color="tertiary"
-                        icon={dark ? Sun : Moon01}
-                        tooltip={dark ? "Modo claro" : "Modo oscuro"}
-                        onClick={() => setDark((v) => !v)}
+                        icon={THEME_META[themePref].icon}
+                        tooltip={`${THEME_META[themePref].label} — clic para cambiar`}
+                        onClick={() => setThemePref((v) => THEME_CYCLE[v])}
                     />
                     {tabs.length === 0 && (
                         <ButtonUtility size="xs" color="tertiary" icon={FolderClosed} tooltip="Abrir documento…" onClick={() => void pickFile()} />

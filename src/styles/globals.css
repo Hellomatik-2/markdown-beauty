@@ -113,13 +113,20 @@ mark[data-mb-hit][data-current="true"] {
 }
 
 /* ═══ Impresión: "que se vea un PDF precioso" ══════════════════════
-   Cmd+P produce un documento limpio: solo el artículo, sin chrome.   */
+   Cmd+P / Exportar PDF producen un documento limpio: solo el artículo,
+   sin chrome, en el tema activo (claro u oscuro).                    */
 @media print {
     @page {
         margin: 18mm 16mm;
     }
     .no-print {
         display: none !important;
+    }
+    /* Colores fieles: sin esto WebKit descarta los fondos (bloques de
+       código, tablas, badges, fórmulas resaltadas) al imprimir. */
+    html {
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
     }
     /* CRÍTICO para paginar: deshacer TODA la cadena de alturas fijas y
        overflow (html/body hidden + flex h-full + main overflow-auto).
@@ -138,11 +145,22 @@ mark[data-mb-hit][data-current="true"] {
         overflow: visible !important;
         height: auto !important;
     }
+    /* El PDF hereda el tema activo: papel blanco en claro, lienzo
+       oscuro real en oscuro (el fondo del canvas cubre toda la hoja). */
     body {
         background: white !important;
     }
+    .dark-mode body {
+        background: var(--color-bg-primary) !important;
+    }
     article {
         max-width: 100% !important;
+    }
+    /* Los resaltados de búsqueda (Cmd+F) no pertenecen al documento */
+    mark[data-mb-hit] {
+        background: transparent !important;
+        outline: none !important;
+        color: inherit !important;
     }
     /* Evitar cortes feos */
     h1, h2, h3, h4 {

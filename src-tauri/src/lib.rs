@@ -24,14 +24,22 @@ fn get_opened_file(state: State<'_, OpenedFile>) -> Option<String> {
 /// Exporta el documento renderizado a PDF sin diálogo de impresión:
 /// NSPrintOperation sobre el WKWebView con jobDisposition = guardar a
 /// archivo. Pagina con los estilos `@media print` de la app.
+///
+/// `dark` + `page_rgb`: NSPrintInfo deja la banda de márgenes sin pintar
+/// (papel blanco), inaceptable en tema oscuro. En oscuro imprimimos a un
+/// temporal y componemos cada página sobre un rectángulo del color real
+/// del lienzo (CoreGraphics, vectorial — el texto sigue seleccionable).
 #[tauri::command]
-async fn export_pdf(window: tauri::WebviewWindow, dest: String) -> Result<(), String> {
+async fn export_pdf(window: tauri::WebviewWindow, dest: String, dark: Option<bool>, page_rgb: Option<[f64; 3]>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        eprintln!("[export_pdf] dest={dest}");
+        let dark = dark.unwrap_or(false);
+        let print_target = if dark { format!("{dest}.print-tmp.pdf") } else { dest.clone() };
+        eprintln!("[export_pdf] dest={dest} dark={dark}");
         let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(&print_target);
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        let dest_for_op = dest.clone();
+        let dest_for_op = print_target.clone();
         window
             .with_webview(move |webview| {
                 let result = unsafe { run_pdf_print_operation(webview.inner() as *mut std::ffi::c_void, &dest_for_op) };
@@ -44,43 +52,141 @@ async fn export_pdf(window: tauri::WebviewWindow, dest: String) -> Result<(), St
 
         // La operación corre modal-async en el hilo principal: esperar a que
         // el PDF exista, termine en %%EOF y su tamaño quede estable.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
-        let mut last_size: u64 = 0;
-        let mut stable_iterations = 0u32;
-        loop {
-            tokio_sleep(std::time::Duration::from_millis(300)).await;
-            if std::time::Instant::now() > deadline {
-                return Err("Tiempo de espera agotado generando el PDF".to_string());
-            }
-            let Ok(meta) = std::fs::metadata(&dest) else { continue };
-            let size = meta.len();
-            if size == 0 {
-                continue;
-            }
-            if size == last_size {
-                stable_iterations += 1;
-            } else {
-                stable_iterations = 0;
-                last_size = size;
-            }
-            if stable_iterations >= 3 && pdf_looks_complete(&dest) {
-                return Ok(());
-            }
+        let wait_path = print_target.clone();
+        let completed = tauri::async_runtime::spawn_blocking(move || wait_pdf_complete_sync(&wait_path, 90))
+            .await
+            .map_err(|e| e.to_string())?;
+        if !completed {
+            return Err("Tiempo de espera agotado generando el PDF".to_string());
         }
+
+        if dark {
+            let rgb = page_rgb.unwrap_or([10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0]);
+            let result = unsafe { composite_pdf_on_color(&print_target, &dest, rgb) };
+            let _ = std::fs::remove_file(&print_target);
+            result?;
+        }
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (window, dest);
+        let _ = (window, dest, dark, page_rgb);
         Err("Exportar PDF solo está soportado en macOS".to_string())
     }
 }
 
+/// Espera (bloqueante) a que el PDF exista, su tamaño quede estable y
+/// termine en %%EOF. Devuelve false si vence el plazo.
 #[cfg(target_os = "macos")]
-async fn tokio_sleep(duration: std::time::Duration) {
-    // tauri re-exporta tokio como runtime async de los commands
-    tauri::async_runtime::spawn_blocking(move || std::thread::sleep(duration))
-        .await
-        .ok();
+fn wait_pdf_complete_sync(path: &str, timeout_secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut last_size: u64 = 0;
+    let mut stable_iterations = 0u32;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        let Ok(meta) = std::fs::metadata(path) else { continue };
+        let size = meta.len();
+        if size == 0 {
+            continue;
+        }
+        if size == last_size {
+            stable_iterations += 1;
+        } else {
+            stable_iterations = 0;
+            last_size = size;
+        }
+        if stable_iterations >= 3 && pdf_looks_complete(path) {
+            return true;
+        }
+    }
+}
+
+/// CoreGraphics (API C): compositor de PDF para el export en oscuro.
+#[cfg(target_os = "macos")]
+mod cg {
+    use std::ffi::c_void;
+    pub type CGPDFDocumentRef = *mut c_void;
+    pub type CGPDFPageRef = *mut c_void;
+    pub type CGContextRef = *mut c_void;
+    pub type CFURLRef = *const c_void;
+    pub type CFDictionaryRef = *const c_void;
+    pub const K_CGPDF_MEDIA_BOX: i32 = 0;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        pub fn CGPDFDocumentCreateWithURL(url: CFURLRef) -> CGPDFDocumentRef;
+        pub fn CGPDFDocumentRelease(doc: CGPDFDocumentRef);
+        pub fn CGPDFDocumentGetNumberOfPages(doc: CGPDFDocumentRef) -> usize;
+        pub fn CGPDFDocumentGetPage(doc: CGPDFDocumentRef, page: usize) -> CGPDFPageRef;
+        pub fn CGPDFPageGetBoxRect(page: CGPDFPageRef, box_type: i32) -> objc2_foundation::NSRect;
+        pub fn CGPDFContextCreateWithURL(url: CFURLRef, media_box: *const objc2_foundation::NSRect, aux: CFDictionaryRef) -> CGContextRef;
+        pub fn CGPDFContextBeginPage(ctx: CGContextRef, page_info: CFDictionaryRef);
+        pub fn CGPDFContextEndPage(ctx: CGContextRef);
+        pub fn CGPDFContextClose(ctx: CGContextRef);
+        pub fn CGContextRelease(ctx: CGContextRef);
+        pub fn CGContextSetRGBFillColor(ctx: CGContextRef, r: f64, g: f64, b: f64, a: f64);
+        pub fn CGContextFillRect(ctx: CGContextRef, rect: objc2_foundation::NSRect);
+        pub fn CGContextDrawPDFPage(ctx: CGContextRef, page: CGPDFPageRef);
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn ns_file_url(path: &str) -> objc2::rc::Retained<objc2::runtime::AnyObject> {
+    use objc2::{class, msg_send, rc::Retained, runtime::AnyObject};
+    let s: Retained<AnyObject> =
+        msg_send![class!(NSString), stringWithUTF8String: format!("{path}\0").as_ptr() as *const std::os::raw::c_char];
+    msg_send![class!(NSURL), fileURLWithPath: &*s]
+}
+
+/// Reescribe `src` en `dst` pintando cada página entera (media box, con
+/// banda de márgenes incluida) del color del lienzo y dibujando encima la
+/// página original. Salida 100% vectorial: el texto sigue seleccionable.
+#[cfg(target_os = "macos")]
+unsafe fn composite_pdf_on_color(src: &str, dst: &str, rgb: [f64; 3]) -> Result<(), String> {
+    use cg::*;
+    use objc2::rc::Retained;
+
+    let src_url = ns_file_url(src);
+    let dst_url = ns_file_url(dst);
+
+    // NSURL y CFURL son toll-free bridged
+    let doc = CGPDFDocumentCreateWithURL(Retained::as_ptr(&src_url) as CFURLRef);
+    if doc.is_null() {
+        return Err("No se pudo abrir el PDF intermedio".to_string());
+    }
+    let pages = CGPDFDocumentGetNumberOfPages(doc);
+    if pages == 0 {
+        CGPDFDocumentRelease(doc);
+        return Err("El PDF intermedio no tiene páginas".to_string());
+    }
+
+    let first_box = CGPDFPageGetBoxRect(CGPDFDocumentGetPage(doc, 1), K_CGPDF_MEDIA_BOX);
+    let ctx = CGPDFContextCreateWithURL(Retained::as_ptr(&dst_url) as CFURLRef, &first_box, std::ptr::null());
+    if ctx.is_null() {
+        CGPDFDocumentRelease(doc);
+        return Err("No se pudo crear el PDF de salida".to_string());
+    }
+
+    for i in 1..=pages {
+        let page = CGPDFDocumentGetPage(doc, i);
+        if page.is_null() {
+            continue;
+        }
+        let media = CGPDFPageGetBoxRect(page, K_CGPDF_MEDIA_BOX);
+        CGPDFContextBeginPage(ctx, std::ptr::null());
+        CGContextSetRGBFillColor(ctx, rgb[0], rgb[1], rgb[2], 1.0);
+        CGContextFillRect(ctx, media);
+        CGContextDrawPDFPage(ctx, page);
+        CGPDFContextEndPage(ctx);
+    }
+
+    CGPDFContextClose(ctx);
+    CGContextRelease(ctx);
+    CGPDFDocumentRelease(doc);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -114,10 +220,7 @@ unsafe fn run_pdf_print_operation(wk_webview: *mut std::ffi::c_void, dest: &str)
     }
 
     // NSPrintInfo con jobDisposition = NSPrintSaveJob → escribe PDF a dest
-    let ns_dest: Retained<AnyObject> = {
-        let s: Retained<AnyObject> = msg_send![class!(NSString), stringWithUTF8String: format!("{dest}\0").as_ptr() as *const std::os::raw::c_char];
-        msg_send![class!(NSURL), fileURLWithPath: &*s]
-    };
+    let ns_dest: Retained<AnyObject> = ns_file_url(dest);
     let print_info: Retained<AnyObject> = msg_send![class!(NSPrintInfo), sharedPrintInfo];
     let print_info: Retained<AnyObject> = msg_send![&*print_info, copy];
 
@@ -172,6 +275,13 @@ unsafe fn run_pdf_print_operation(wk_webview: *mut std::ffi::c_void, dest: &str)
     Ok(())
 }
 
+/// Hook de test/automatización: MB_THEME=dark|light|system fuerza el
+/// tema al arrancar (para validar el export PDF en cada tema).
+#[tauri::command]
+fn get_startup_theme() -> Option<String> {
+    std::env::var("MB_THEME").ok()
+}
+
 #[tauri::command]
 fn read_markdown(path: String) -> Result<MarkdownDoc, String> {
     let content = std::fs::read_to_string(&path).map_err(|e| format!("No se pudo leer «{path}»: {e}"))?;
@@ -204,22 +314,35 @@ pub fn run() {
         .setup(|app| {
             // Hook de test/automatización: MB_EXPORT_PDF=/ruta/salida.pdf
             // exporta el documento activo a PDF a los 6s de arrancar.
+            // Con MB_THEME=dark replica el flujo oscuro completo
+            // (temporal + composición del color de lienzo).
             if let Ok(dest) = std::env::var("MB_EXPORT_PDF") {
                 let handle = app.handle().clone();
+                let dark = std::env::var("MB_THEME").is_ok_and(|t| t == "dark");
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(6));
+                    let print_target = if dark { format!("{dest}.print-tmp.pdf") } else { dest.clone() };
                     if let Some(window) = handle.get_webview_window("main") {
-                        let d = dest.clone();
+                        let d = print_target.clone();
                         let _ = window.with_webview(move |webview| {
                             let result = unsafe { run_pdf_print_operation(webview.inner() as *mut std::ffi::c_void, &d) };
-                            eprintln!("[MB_EXPORT_PDF] {result:?}");
+                            eprintln!("[MB_EXPORT_PDF] print op: {result:?}");
                         });
+                    }
+                    if dark {
+                        if wait_pdf_complete_sync(&print_target, 90) {
+                            let result = unsafe { composite_pdf_on_color(&print_target, &dest, [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0]) };
+                            let _ = std::fs::remove_file(&print_target);
+                            eprintln!("[MB_EXPORT_PDF] composite: {result:?}");
+                        } else {
+                            eprintln!("[MB_EXPORT_PDF] timeout esperando el PDF intermedio");
+                        }
                     }
                 });
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_opened_file, read_markdown, export_pdf])
+        .invoke_handler(tauri::generate_handler![get_opened_file, read_markdown, export_pdf, get_startup_theme])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
