@@ -689,7 +689,7 @@ export default function App() {
                             />
                         </>
                     )}
-                    {doc && IS_TAURI && (
+                    {doc && (
                         <ButtonUtility
                             size="xs"
                             color={chatOpen ? "secondary" : "tertiary"}
@@ -826,7 +826,7 @@ export default function App() {
 
                 {/* ── Asistente del documento (panel derecho) ────────── */}
                 {(() => {
-                    const showChat = chatOpen && !!doc && IS_TAURI;
+                    const showChat = chatOpen && !!doc;
                     return (
                         <div
                             aria-hidden={!showChat}
@@ -842,7 +842,14 @@ export default function App() {
                                     showChat ? "translate-x-0 opacity-100" : "translate-x-3 opacity-0",
                                 )}
                             >
-                                {doc && <ChatPanel docPath={doc.path} docContent={doc.content} fileTitle={fileTitle(doc.path)} />}
+                                {doc && (
+                                    <ChatPanel
+                                        docPath={doc.path}
+                                        docContent={doc.content}
+                                        fileTitle={fileTitle(doc.path)}
+                                        onClose={() => setChatOpen(false)}
+                                    />
+                                )}
                             </div>
                         </div>
                     );

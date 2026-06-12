@@ -112,6 +112,21 @@ mark[data-mb-hit][data-current="true"] {
     font-family: var(--font-body);
 }
 
+/* ─── Crossfade del widget (flecha ↔ loader, labels) ──────────────── */
+@keyframes hm-fade-swap {
+    from {
+        opacity: 0;
+        transform: translateY(2px);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+.hm-fade-swap {
+    animation: hm-fade-swap 0.25s ease-out both;
+}
+
 /* ─── Chat del documento: tipografía compacta para el panel ───────── */
 .chat-markdown {
     font-size: 0.875rem;

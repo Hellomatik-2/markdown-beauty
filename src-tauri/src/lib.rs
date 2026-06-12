@@ -585,6 +585,95 @@ async fn chat_send(
     Ok(())
 }
 
+#[derive(Serialize, Clone)]
+struct SlashCommand {
+    name: String,
+    description: String,
+}
+
+/// Descripción del frontmatter YAML de un .md (description: …).
+fn md_description(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    if !text.starts_with("---") {
+        return None;
+    }
+    for line in text.lines().skip(1).take(40) {
+        if line.trim() == "---" {
+            break;
+        }
+        if let Some(rest) = line.trim().strip_prefix("description:") {
+            let d: String = rest.trim().trim_matches('"').chars().take(120).collect();
+            if !d.is_empty() {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+fn collect_md_commands(dir: &std::path::Path, prefix: &str, out: &mut Vec<SlashCommand>) {
+    let Ok(read_dir) = std::fs::read_dir(dir) else { return };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            collect_md_commands(&path, &format!("{prefix}{name}:"), out);
+        } else if let Some(stem) = name.strip_suffix(".md") {
+            out.push(SlashCommand {
+                name: format!("{prefix}{stem}"),
+                description: md_description(&path).unwrap_or_else(|| "Comando personalizado".to_string()),
+            });
+        }
+    }
+}
+
+/// Lista de slash commands para el autocompletado del chat, como en
+/// Claude Code: builtins útiles en modo print + comandos custom del
+/// usuario (~/.claude/commands) + skills invocables (~/.claude/skills).
+#[tauri::command]
+fn chat_list_commands() -> Vec<SlashCommand> {
+    let mut out: Vec<SlashCommand> = [
+        ("compact", "Compacta la conversación conservando lo esencial"),
+        ("context", "Visualiza el uso de contexto de la sesión"),
+        ("cost", "Coste y duración de la sesión actual"),
+        ("status", "Estado de Claude Code (modelo, cuenta, sesión)"),
+        ("usage", "Límites de uso del plan actual"),
+        ("todos", "Lista las tareas de la sesión"),
+        ("release-notes", "Novedades de Claude Code"),
+        ("help", "Ayuda y comandos disponibles"),
+        ("doctor", "Diagnostica la instalación de Claude Code"),
+    ]
+    .into_iter()
+    .map(|(n, d)| SlashCommand { name: n.to_string(), description: d.to_string() })
+    .collect();
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    collect_md_commands(std::path::Path::new(&home).join(".claude/commands").as_path(), "", &mut out);
+
+    if let Ok(read_dir) = std::fs::read_dir(std::path::Path::new(&home).join(".claude/skills")) {
+        for entry in read_dir.flatten() {
+            let skill = entry.path().join("SKILL.md");
+            if skill.exists() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                out.push(SlashCommand {
+                    name,
+                    description: md_description(&skill).unwrap_or_else(|| "Skill del usuario".to_string()),
+                });
+            }
+        }
+    }
+
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.name == b.name);
+    out
+}
+
 /// Hook de test genérico: lee variables de entorno MB_* (solo MB_).
 #[tauri::command]
 fn get_test_env(name: String) -> Option<String> {
@@ -681,6 +770,7 @@ pub fn run() {
             pick_markdown_paths,
             chat_send,
             chat_reset,
+            chat_list_commands,
             get_chat_test,
             get_test_env
         ])
