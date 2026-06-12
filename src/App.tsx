@@ -294,6 +294,13 @@ export default function App() {
         return () => media.removeEventListener("change", onChange);
     }, []);
 
+    // Icono del Dock acorde al modo del sistema (variante clara/oscura),
+    // actualizado en vivo cuando macOS cambia de apariencia.
+    useEffect(() => {
+        if (!IS_TAURI) return;
+        invoke("set_dock_icon", { dark: systemDark }).catch(() => {});
+    }, [systemDark]);
+
     // Hook de test: MB_THEME fuerza el tema al arrancar
     useEffect(() => {
         if (!IS_TAURI) return;

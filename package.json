@@ -1,13 +1,14 @@
 {
   "name": "markdown-beauty",
   "private": true,
-  "version": "1.8.0",
+  "version": "1.8.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:app": "./scripts/build-release.sh"
   },
   "dependencies": {
     "@blocknote/core": "^0.51.4",

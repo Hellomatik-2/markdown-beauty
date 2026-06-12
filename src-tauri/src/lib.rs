@@ -697,6 +697,46 @@ fn stop_ttyd() {
     }
 }
 
+/// Icono del Dock acorde al modo del sistema (claro/oscuro). El
+/// frontend ya sigue prefers-color-scheme en vivo y nos avisa de cada
+/// cambio; aquí solo cargamos el PNG correspondiente y se lo damos a
+/// NSApplication (sin Xcode no hay Assets.car con appearances).
+#[tauri::command]
+fn set_dock_icon(app: tauri::AppHandle, dark: bool) -> Result<(), String> {
+    let name = if dark { "icons/icon-dark.png" } else { "icons/icon.png" };
+    let mut path: Option<std::path::PathBuf> = None;
+    if let Ok(res) = app.path().resource_dir() {
+        let p = res.join(name);
+        if p.exists() {
+            path = Some(p);
+        }
+    }
+    if path.is_none() {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.ancestors().nth(3) {
+                let p = dir.join(name);
+                if p.exists() {
+                    path = Some(p);
+                }
+            }
+        }
+    }
+    let Some(path) = path else {
+        return Err(format!("icono no encontrado: {name}"));
+    };
+    app.run_on_main_thread(move || unsafe {
+        use objc2::rc::Retained;
+        use objc2::runtime::AnyObject;
+        use objc2::{class, msg_send};
+        let ns_path = ns_string(&path.to_string_lossy());
+        let alloc: objc2::rc::Allocated<AnyObject> = msg_send![class!(NSImage), alloc];
+        let img: Retained<AnyObject> = msg_send![alloc, initWithContentsOfFile: &*ns_path];
+        let ns_app: Retained<AnyObject> = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![&*ns_app, setApplicationIconImage: &*img];
+    })
+    .map_err(|e| e.to_string())
+}
+
 #[derive(serde::Deserialize)]
 struct OpenDoc {
     path: String,
@@ -996,6 +1036,7 @@ pub fn run() {
             chat_list_commands,
             chat_set_doc,
             chat_terminal_url,
+            set_dock_icon,
             get_chat_test,
             get_test_env
         ])
