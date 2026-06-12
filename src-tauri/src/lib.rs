@@ -282,6 +282,137 @@ fn get_startup_theme() -> Option<String> {
     std::env::var("MB_THEME").ok()
 }
 
+const MD_EXTS: [&str; 5] = ["md", "markdown", "mdown", "mkd", "mdx"];
+/// Carpetas que nunca contienen documentación del usuario
+const SKIP_DIRS: [&str; 6] = ["node_modules", "target", "dist", "build", "vendor", "__pycache__"];
+const MAX_MD_FILES: usize = 200;
+
+fn is_markdown(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| MD_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+fn walk_markdown(dir: &std::path::Path, out: &mut Vec<String>) {
+    if out.len() >= MAX_MD_FILES {
+        return;
+    }
+    let Ok(read_dir) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = read_dir.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        if out.len() >= MAX_MD_FILES {
+            return;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            if !SKIP_DIRS.contains(&name.as_str()) {
+                walk_markdown(&path, out);
+            }
+        } else if is_markdown(&path) {
+            out.push(path.to_string_lossy().to_string());
+        }
+    }
+}
+
+/// Expande una mezcla de rutas (archivos .md y/o carpetas) a la lista
+/// plana de markdowns a abrir: las carpetas se recorren recursivamente
+/// (orden alfabético, sin ocultos ni node_modules/target/…, tope 200).
+#[tauri::command]
+fn expand_markdown_paths(paths: Vec<String>) -> Vec<String> {
+    eprintln!("[expand_markdown_paths] in={paths:?}");
+    let mut out: Vec<String> = Vec::new();
+    for p in paths {
+        let path = std::path::PathBuf::from(&p);
+        if path.is_dir() {
+            walk_markdown(&path, &mut out);
+        } else if is_markdown(&path) && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    eprintln!("[expand_markdown_paths] out={} archivos", out.len());
+    out
+}
+
+/// Diálogo de apertura estilo VS Code: un único NSOpenPanel que acepta
+/// archivos Markdown Y carpetas (el plugin dialog de Tauri no permite
+/// mezclar ambos). Las carpetas se expanden a todos sus .md.
+#[tauri::command]
+async fn pick_markdown_paths(window: tauri::WebviewWindow) -> Result<Vec<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!("[pick_markdown_paths] abriendo panel");
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
+        window
+            .run_on_main_thread(move || {
+                let picked = unsafe { run_open_panel() };
+                eprintln!("[pick_markdown_paths] panel devolvió {} rutas", picked.len());
+                let _ = tx.send(picked);
+            })
+            .map_err(|e| e.to_string())?;
+        let picked = tauri::async_runtime::spawn_blocking(move || {
+            rx.recv_timeout(std::time::Duration::from_secs(600)).unwrap_or_default()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(expand_markdown_paths(picked))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window;
+        Err("Solo soportado en macOS".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn ns_string(s: &str) -> objc2::rc::Retained<objc2::runtime::AnyObject> {
+    use objc2::{class, msg_send};
+    msg_send![class!(NSString), stringWithUTF8String: format!("{s}\0").as_ptr() as *const std::os::raw::c_char]
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn run_open_panel() -> Vec<String> {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    let panel: Retained<AnyObject> = msg_send![class!(NSOpenPanel), openPanel];
+    let _: () = msg_send![&*panel, setCanChooseFiles: true];
+    let _: () = msg_send![&*panel, setCanChooseDirectories: true];
+    let _: () = msg_send![&*panel, setAllowsMultipleSelection: true];
+    let _: () = msg_send![&*panel, setResolvesAliases: true];
+    let message = ns_string("Elige documentos Markdown o carpetas (se abrirán todos sus .md)");
+    let _: () = msg_send![&*panel, setMessage: &*message];
+    // allowedFileTypes filtra archivos; las carpetas siguen seleccionables
+    let types: Retained<AnyObject> = msg_send![class!(NSMutableArray), array];
+    for ext in MD_EXTS {
+        let s = ns_string(ext);
+        let _: () = msg_send![&*types, addObject: &*s];
+    }
+    let _: () = msg_send![&*panel, setAllowedFileTypes: &*types];
+
+    let response: isize = msg_send![&*panel, runModal];
+    if response != 1 {
+        return Vec::new(); // NSModalResponseOK == 1; cancelado
+    }
+    let urls: Retained<AnyObject> = msg_send![&*panel, URLs];
+    let count: usize = msg_send![&*urls, count];
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let url: Retained<AnyObject> = msg_send![&*urls, objectAtIndex: i];
+        let path: Retained<AnyObject> = msg_send![&*url, path];
+        let cstr: *const std::os::raw::c_char = msg_send![&*path, UTF8String];
+        if !cstr.is_null() {
+            out.push(std::ffi::CStr::from_ptr(cstr).to_string_lossy().to_string());
+        }
+    }
+    out
+}
+
 #[tauri::command]
 fn read_markdown(path: String) -> Result<MarkdownDoc, String> {
     let content = std::fs::read_to_string(&path).map_err(|e| format!("No se pudo leer «{path}»: {e}"))?;
@@ -342,7 +473,14 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_opened_file, read_markdown, export_pdf, get_startup_theme])
+        .invoke_handler(tauri::generate_handler![
+            get_opened_file,
+            read_markdown,
+            export_pdf,
+            get_startup_theme,
+            expand_markdown_paths,
+            pick_markdown_paths
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {

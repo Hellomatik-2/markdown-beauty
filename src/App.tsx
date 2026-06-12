@@ -4,7 +4,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { ButtonUtility } from "@/components/base/buttons/button-utility";
 import { Button } from "@/components/base/buttons/button";
@@ -120,6 +120,26 @@ export default function App() {
         }
     }, []);
 
+    /** Abre una mezcla de rutas (archivos .md y/o carpetas): las carpetas
+     *  se expanden en el backend a todos sus markdowns (recursivo). */
+    const openPaths = useCallback(
+        async (paths: string[]) => {
+            if (!paths.length) return;
+            let files = paths;
+            if (IS_TAURI) {
+                files = await invoke<string[]>("expand_markdown_paths", { paths }).catch(() => paths.filter((p) => MD_EXT.test(p)));
+            }
+            if (!files.length) {
+                setError("No hay documentos Markdown en lo que has soltado.");
+                return;
+            }
+            for (let i = 0; i < files.length; i++) {
+                await openDoc(files[i], { activate: i === 0 });
+            }
+        },
+        [openDoc],
+    );
+
     const closeTab = useCallback((path: string) => {
         scrollMemory.current.delete(path);
         setTabs((prev) => {
@@ -163,8 +183,8 @@ export default function App() {
             }
         })();
 
-        // Doble click en Finder con la app ya abierta
-        listen<string>("open-file", (event) => void openDoc(event.payload)).then((unlisten) => cleanups.push(unlisten));
+        // Doble click en Finder con la app ya abierta (archivo o carpeta)
+        listen<string>("open-file", (event) => void openPaths([event.payload])).then((unlisten) => cleanups.push(unlisten));
 
         // Arranque: el RunEvent::Opened de macOS puede llegar antes O después
         // de que monte el frontend (y el emit puede perderse si aún no hay
@@ -174,19 +194,18 @@ export default function App() {
                 if (disposed) return;
                 const opened = await invoke<string | null>("get_opened_file").catch(() => null);
                 if (opened) {
-                    void openDoc(opened);
+                    void openPaths([opened]);
                     return;
                 }
                 await new Promise((resolve) => setTimeout(resolve, 125));
             }
         })();
 
-        // Drag & drop de un .md sobre la ventana
+        // Drag & drop de .md o CARPETAS sobre la ventana (las carpetas
+        // abren todos sus markdowns en pestañas, como VS Code)
         getCurrentWebview()
             .onDragDropEvent((event) => {
-                if (event.payload.type === "drop") {
-                    for (const p of event.payload.paths.filter((p) => MD_EXT.test(p))) void openDoc(p);
-                }
+                if (event.payload.type === "drop") void openPaths(event.payload.paths);
             })
             .then((unlisten) => cleanups.push(unlisten));
 
@@ -202,7 +221,7 @@ export default function App() {
             disposed = true;
             cleanups.forEach((fn) => fn());
         };
-    }, [openDoc]);
+    }, [openDoc, openPaths]);
 
     // ── Persistir sesión de pestañas ──────────────────────────────────
     useEffect(() => {
@@ -286,7 +305,17 @@ export default function App() {
         return () => observer.disconnect();
     }, [doc]);
 
-    // ── Atajos de teclado (Cmd+F búsqueda) ────────────────────────────
+    /** Cmd+O estilo VS Code: un único diálogo nativo que acepta archivos
+     *  Markdown y carpetas; el backend expande las carpetas a sus .md. */
+    const pickFile = useCallback(async () => {
+        if (!IS_TAURI) return;
+        const files = await invoke<string[]>("pick_markdown_paths").catch(() => [] as string[]);
+        for (let i = 0; i < files.length; i++) {
+            await openDoc(files[i], { activate: i === 0 });
+        }
+    }, [openDoc]);
+
+    // ── Atajos de teclado (Cmd+F búsqueda, Cmd+O abrir) ───────────────
     useEffect(() => {
         const onKey = (e: KeyboardEvent) => {
             if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
@@ -296,13 +325,58 @@ export default function App() {
                     searchInputRef.current?.focus();
                     searchInputRef.current?.select();
                 });
+            } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
+                e.preventDefault();
+                void pickFile();
             } else if (e.key === "Escape" && search.open) {
                 search.close();
             }
         };
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
-    }, [search.open, search.setOpen, search.close]);
+    }, [search.open, search.setOpen, search.close, pickFile]);
+
+    // ── Ventana: arrastrar desde la barra/pestañas + doble clic = zoom ─
+    /** El header NO usa -webkit-app-region: drag — WebKit se traga los
+     *  eventos de ratón en esa región y los dblclick/click jamás llegan
+     *  al DOM. El arrastre se hace por JS con umbral: si el ratón se
+     *  mueve >6px con el botón pulsado se delega en el drag nativo de la
+     *  ventana; un click normal (pestañas, botones) sigue llegando. */
+    const dragWindowOnMove = useCallback((e: React.MouseEvent) => {
+        if (!IS_TAURI || e.button !== 0) return;
+        const startX = e.clientX;
+        const startY = e.clientY;
+        const onMove = (ev: MouseEvent) => {
+            if (Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY) > 6) {
+                cleanup();
+                void getCurrentWindow().startDragging();
+            }
+        };
+        const cleanup = () => {
+            window.removeEventListener("mousemove", onMove);
+            window.removeEventListener("mouseup", cleanup);
+        };
+        window.addEventListener("mousemove", onMove);
+        window.addEventListener("mouseup", cleanup);
+    }, []);
+
+    /** Arrastre desde la zona libre del header (no botones/inputs; las
+     *  pestañas llevan su propio onMouseDown y también arrastran). */
+    const dragWindowFromHeader = useCallback(
+        (e: React.MouseEvent) => {
+            if ((e.target as Element).closest("button, [role='button'], [role='tab'], input")) return;
+            dragWindowOnMove(e);
+        },
+        [dragWindowOnMove],
+    );
+
+    /** Doble clic en zona libre de la barra → maximizar/restaurar (zoom
+     *  de macOS), como el titlebar nativo. Ignora botones y pestañas. */
+    const zoomOnDoubleClick = useCallback((e: React.MouseEvent) => {
+        if (!IS_TAURI) return;
+        if ((e.target as Element).closest("button, [role='button'], [role='tab'], input")) return;
+        void getCurrentWindow().toggleMaximize();
+    }, []);
 
     // ── Exportar PDF directo (sin diálogo de impresión) ───────────────
     const exportPdf = useCallback(async () => {
@@ -333,21 +407,16 @@ export default function App() {
         }
     }, [doc, exportState]);
 
-    const pickFile = useCallback(async () => {
-        const selected = await openDialog({
-            multiple: true,
-            filters: [{ name: "Markdown", extensions: ["md", "markdown", "mdown", "mkd", "mdx"] }],
-        });
-        const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
-        for (const p of paths) void openDoc(p);
-    }, [openDoc]);
-
     const docDir = doc ? dirname(doc.path) : "/";
 
     return (
         <div className="flex h-full flex-col bg-primary">
             {/* ── Barra superior: pestañas ────────────────────────────── */}
-            <header className="titlebar-drag no-print relative z-20 flex h-12 shrink-0 items-center gap-2 border-b border-secondary bg-primary pr-3 pl-[84px]">
+            <header
+                onMouseDown={dragWindowFromHeader}
+                onDoubleClick={zoomOnDoubleClick}
+                className="no-print relative z-20 flex h-12 shrink-0 items-center gap-2 border-b border-secondary bg-primary pr-3 pl-[84px] select-none"
+            >
                 <div className="titlebar-no-drag flex items-center">
                     <ButtonUtility
                         size="xs"
@@ -372,6 +441,7 @@ export default function App() {
                                             aria-selected={isActive}
                                             title={tab.path}
                                             onClick={() => setActivePath(tab.path)}
+                                            onMouseDown={dragWindowOnMove}
                                             onKeyDown={(e) => {
                                                 if (e.key === "Enter" || e.key === " ") setActivePath(tab.path);
                                             }}
