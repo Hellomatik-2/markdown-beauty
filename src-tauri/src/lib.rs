@@ -697,13 +697,70 @@ fn stop_ttyd() {
     }
 }
 
-/// Regenera el prompt del sistema y la copia local del documento activo.
-/// Las sesiones NUEVAS de la terminal nacen scoped a este documento.
+#[derive(serde::Deserialize)]
+struct OpenDoc {
+    path: String,
+    content: String,
+}
+
+/// Nombre dentro del workspace; si dos pestañas comparten nombre de
+/// archivo, se desambigua con la carpeta padre (guias__interna.md).
+fn workspace_name(path: &str, duplicated: bool) -> String {
+    let mut parts = path.rsplit('/');
+    let file = parts.next().unwrap_or("documento.md");
+    if duplicated {
+        if let Some(parent) = parts.next() {
+            return format!("{parent}__{file}");
+        }
+    }
+    file.to_string()
+}
+
+/// Regenera el ÁMBITO del agente: todos los documentos abiertos (un
+/// archivo suelto o la carpeta entera que abriste) copiados al
+/// workspace, el activo embebido completo en el prompt y los demás
+/// listados para que el agente los lea con su Read. Las sesiones
+/// NUEVAS de la terminal nacen con este ámbito.
 #[tauri::command]
-fn chat_set_doc(doc_path: String, doc_content: String) -> Result<(), String> {
+fn chat_set_doc(doc_path: String, doc_content: String, open_docs: Option<Vec<OpenDoc>>) -> Result<(), String> {
     let ws = chat_workspace();
-    let file_name = doc_path.rsplit('/').next().unwrap_or("documento.md").to_string();
-    std::fs::write(ws.join(&file_name), &doc_content).map_err(|e| e.to_string())?;
+    let docs = open_docs.unwrap_or_default();
+
+    // nombres del workspace (desambiguando duplicados por carpeta padre)
+    let mut name_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for d in docs.iter() {
+        let f = d.path.rsplit('/').next().unwrap_or("documento.md").to_string();
+        *name_counts.entry(f).or_insert(0) += 1;
+    }
+    let active_file = doc_path.rsplit('/').next().unwrap_or("documento.md").to_string();
+    *name_counts.entry(active_file.clone()).or_insert(0) += 0;
+
+    let mut names: Vec<String> = Vec::new();
+    let mut active_ws_name = workspace_name(&doc_path, name_counts.get(&active_file).copied().unwrap_or(0) > 1);
+    for d in docs.iter() {
+        let f = d.path.rsplit('/').next().unwrap_or("documento.md").to_string();
+        let dup = name_counts.get(&f).copied().unwrap_or(0) > 1;
+        let name = workspace_name(&d.path, dup);
+        std::fs::write(ws.join(&name), &d.content).map_err(|e| e.to_string())?;
+        if d.path == doc_path {
+            active_ws_name = name.clone();
+        }
+        names.push(name);
+    }
+    if !docs.iter().any(|d| d.path == doc_path) {
+        std::fs::write(ws.join(&active_ws_name), &doc_content).map_err(|e| e.to_string())?;
+        names.push(active_ws_name.clone());
+    }
+
+    // retirar copias de documentos que ya no están abiertos
+    if let Ok(read_dir) = std::fs::read_dir(&ws) {
+        for entry in read_dir.flatten() {
+            let n = entry.file_name().to_string_lossy().to_string();
+            if n.ends_with(".md") && !names.contains(&n) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 
     let mut content = doc_content;
     if content.len() > CHAT_DOC_LIMIT {
@@ -714,13 +771,26 @@ fn chat_set_doc(doc_path: String, doc_content: String) -> Result<(), String> {
         content.truncate(end);
         content.push_str("\n\n[… documento truncado por longitud …]");
     }
+
+    let others: Vec<&String> = names.iter().filter(|n| **n != active_ws_name).collect();
+    let others_block = if others.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nTambién forman parte de tu ámbito estos documentos abiertos (léelos con Read cuando los necesites):\n{}",
+            others.iter().map(|n| format!("- ./{n}")).collect::<Vec<_>>().join("\n")
+        )
+    };
+
     let prompt = format!(
         "Eres el asistente de Markdown Beauty dentro de una terminal Claude Code. \
-         Tu ÚNICO foco es el documento «{file_name}» (ruta original: {doc_path}). \
-         Hay una copia actualizada en ./{file_name} de este directorio de trabajo. \
-         Responde en el idioma del usuario citando las secciones relevantes; si te \
-         preguntan por algo ajeno al documento, decláralo con amabilidad y reconduce. \
-         Contenido actual del documento:\n\n<documento>\n{content}\n</documento>"
+         Tu ámbito EXCLUSIVO son los documentos Markdown que el usuario tiene abiertos \
+         (un archivo o una carpeta entera), copiados en este directorio de trabajo. \
+         NO leas, ejecutes ni hables de NADA fuera de este directorio; si te piden algo \
+         ajeno, decláralo con amabilidad y reconduce a los documentos. \
+         Responde en el idioma del usuario citando las secciones relevantes.\n\n\
+         Documento ACTIVO: «{active_ws_name}» (ruta original: {doc_path}, copia en ./{active_ws_name}). \
+         Contenido actual:\n\n<documento>\n{content}\n</documento>{others_block}"
     );
     std::fs::write(chat_home().join("assistant-prompt.md"), prompt).map_err(|e| e.to_string())?;
     Ok(())

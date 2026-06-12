@@ -20,6 +20,9 @@ interface ChatPanelProps {
     /** Contenido ACTUAL del doc — el prompt se regenera con cada cambio
      *  (autosave incluido); las sesiones nuevas nacen al día. */
     docContent: string;
+    /** TODAS las pestañas abiertas: el ámbito del agente (si abriste
+     *  una carpeta, son todos sus markdowns). */
+    openDocs: Array<{ path: string; content: string }>;
     fileTitle: string;
     onClose: () => void;
 }
@@ -30,7 +33,7 @@ const IS_TAURI = "__TAURI_INTERNALS__" in window;
  *  mientras la app esté abierta, aunque cambies de pestaña. */
 const terminalStore = new Map<string, number>();
 
-export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanelProps) {
+export function ChatPanel({ docPath, docContent, openDocs, fileTitle, onClose }: ChatPanelProps) {
     const [, force] = useState(0);
     const rerender = useCallback(() => force((n) => n + 1), []);
     const [url, setUrl] = useState<string | null>(null);
@@ -43,12 +46,12 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
             .catch(() => {});
     }, []);
 
-    // Prompt del documento SIEMPRE al día (cada autosave lo refresca);
-    // la terminal del doc solo se monta cuando su prompt ya está escrito.
+    // Ámbito del agente SIEMPRE al día (cada autosave/pestaña lo
+    // refresca); la terminal solo se monta cuando ya está escrito.
     useEffect(() => {
         if (!IS_TAURI) return;
         let cancelled = false;
-        invoke("chat_set_doc", { docPath, docContent })
+        invoke("chat_set_doc", { docPath, docContent, openDocs })
             .then(() => {
                 if (cancelled) return;
                 if (!terminalStore.has(docPath)) terminalStore.set(docPath, 0);
@@ -59,7 +62,7 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
         return () => {
             cancelled = true;
         };
-    }, [docPath, docContent, rerender]);
+    }, [docPath, docContent, openDocs, rerender]);
 
     const restartSession = useCallback(() => {
         // remonta SOLO el iframe del doc activo → claude nuevo con el

@@ -846,6 +846,7 @@ export default function App() {
                                     <ChatPanel
                                         docPath={doc.path}
                                         docContent={doc.content}
+                                        openDocs={tabs}
                                         fileTitle={fileTitle(doc.path)}
                                         onClose={() => setChatOpen(false)}
                                     />
