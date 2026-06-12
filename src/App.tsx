@@ -258,6 +258,16 @@ export default function App() {
         window.addEventListener("focus", onFocus);
         cleanups.push(() => window.removeEventListener("focus", onFocus));
 
+        // RECARGA EN VIVO: el agente de la terminal edita los archivos
+        // reales — sondeamos el doc activo para que sus ediciones se
+        // rendericen al instante (openDoc no-opea si no hay cambios).
+        const liveReload = window.setInterval(() => {
+            if (editingRef.current) return;
+            const current = activeRef.current;
+            if (current) void openDoc(current, { silent: true, activate: false });
+        }, 2000);
+        cleanups.push(() => window.clearInterval(liveReload));
+
         return () => {
             disposed = true;
             cleanups.forEach((fn) => fn());
