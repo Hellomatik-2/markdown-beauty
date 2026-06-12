@@ -1,0 +1,5 @@
+# Workaround macOS beta (Darwin 27): el ld nuevo emite dylibs con
+# "mis-aligned LINKEDIT string pool" que dyld rechaza al cargar los
+# proc-macros. El linker clásico alinea correctamente.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-ld_classic"]

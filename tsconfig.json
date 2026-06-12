@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noFallthroughCasesInSwitch": true,
+    "baseUrl": ".",
+    "paths": {
+      "next/image": ["./src/shims/next-image.tsx"],
+      "@hm/icons": ["./vendor/hellomatik-ui/_lib/icons"],
+      "@hm/icons/*": ["./vendor/hellomatik-ui/_lib/icons/*"],
+      "@/*": [
+        "./src/*",
+        "./vendor/hellomatik-ui/custom-*",
+        "./vendor/hellomatik-ui/*-base"
+      ],
+      "@/components/*": [
+        "./src/components/*",
+        "./vendor/hellomatik-ui/custom-components/*",
+        "./vendor/hellomatik-ui/components-base/*"
+      ]
+    }
+  },
+  "include": ["src"]
+}

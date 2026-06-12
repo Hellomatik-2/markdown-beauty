@@ -1,0 +1,154 @@
+@import "tailwindcss";
+@import "./theme.css";
+@import "./typography.css";
+
+@plugin "tailwindcss-react-aria-components";
+@plugin "tailwindcss-animate";
+
+@custom-variant dark (&:where(.dark-mode, .dark-mode *));
+
+/* ─── Fuentes (Vite: @fontsource en vez de next/font) ─────────────── */
+:root {
+    --font-inter: "Inter Variable";
+    --font-hedvig: "Hedvig Letters Serif";
+}
+
+/* ─── Scrollbar discreto (HIG: deference) ─────────────────────────── */
+@layer base {
+    * {
+        scrollbar-width: thin;
+        scrollbar-color: color-mix(in oklab, var(--color-fg-quaternary) 28%, transparent) transparent;
+    }
+    *::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+    *::-webkit-scrollbar-track {
+        background: transparent;
+    }
+    *::-webkit-scrollbar-thumb {
+        border-radius: 9999px;
+        background: color-mix(in oklab, var(--color-fg-quaternary) 28%, transparent);
+    }
+
+    html,
+    body,
+    #root {
+        height: 100%;
+    }
+
+    /* App de escritorio: la página NUNCA scrollea — solo los contenedores
+       internos (main, nav). Sin esto, cualquier absolute que escape al ICB
+       vuelve scrolleable el html entero. */
+    html,
+    body {
+        overflow: hidden;
+    }
+
+    body {
+        font-family: var(--font-body);
+        background-color: var(--color-bg-primary);
+        color: var(--color-text-primary);
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+    }
+
+    /* Todo clickable muestra pointer (regla global del proyecto) */
+    button,
+    [role="button"],
+    a,
+    label,
+    summary {
+        cursor: pointer;
+    }
+
+    /* Selección de texto cálida, acorde al lienzo crema */
+    ::selection {
+        background: color-mix(in oklab, var(--color-utility-brand-200) 65%, transparent);
+    }
+}
+
+/* ─── Títulos serif también en modo oscuro ─────────────────────────
+   theme.css solo aplica Hedvig bajo `.hellomatik-mode` (modo claro);
+   en oscuro usamos `.dark-mode` solo, así que replicamos la regla. */
+.dark-mode h1:not(.uppercase):not(.text-xs):not(.text-sm):not(.text-md),
+.dark-mode h2:not(.uppercase):not(.text-xs):not(.text-sm):not(.text-md),
+.dark-mode h3:not(.uppercase):not(.text-xs):not(.text-sm):not(.text-md) {
+    font-family: var(--font-hedvig), Georgia, "Times New Roman", serif;
+    font-optical-sizing: auto;
+    font-weight: 400;
+}
+
+/* ─── Resaltado de búsqueda (Cmd+F) ───────────────────────────────── */
+mark[data-mb-hit] {
+    background: var(--color-utility-yellow-200);
+    color: inherit;
+    border-radius: 3px;
+    padding: 0.05em 0;
+}
+mark[data-mb-hit][data-current="true"] {
+    background: var(--color-utility-orange-300);
+    outline: 2px solid var(--color-utility-orange-400);
+    outline-offset: 0;
+}
+
+/* ─── KaTeX: fórmulas display centradas con scroll si desbordan ────── */
+.katex-display {
+    margin: 1.5rem 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0.25rem 0;
+}
+
+/* ─── Ventana Tauri: arrastre por la barra superior ───────────────── */
+@layer utilities {
+    .titlebar-drag {
+        -webkit-app-region: drag;
+        app-region: drag;
+    }
+    .titlebar-no-drag {
+        -webkit-app-region: no-drag;
+        app-region: no-drag;
+    }
+}
+
+/* ═══ Impresión: "que se vea un PDF precioso" ══════════════════════
+   Cmd+P produce un documento limpio: solo el artículo, sin chrome.   */
+@media print {
+    @page {
+        margin: 18mm 16mm;
+    }
+    .no-print {
+        display: none !important;
+    }
+    /* CRÍTICO para paginar: deshacer TODA la cadena de alturas fijas y
+       overflow (html/body hidden + flex h-full + main overflow-auto).
+       Sin esto NSPrintOperation/print solo emite la primera página. */
+    html,
+    body,
+    #root,
+    #root > div,
+    #root > div > div {
+        height: auto !important;
+        min-height: 0 !important;
+        overflow: visible !important;
+        display: block !important;
+    }
+    .print-plain {
+        overflow: visible !important;
+        height: auto !important;
+    }
+    body {
+        background: white !important;
+    }
+    article {
+        max-width: 100% !important;
+    }
+    /* Evitar cortes feos */
+    h1, h2, h3, h4 {
+        break-after: avoid-page;
+    }
+    pre, table, blockquote, img, figure {
+        break-inside: avoid-page;
+    }
+}

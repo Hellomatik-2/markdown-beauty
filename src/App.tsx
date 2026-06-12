@@ -1,0 +1,522 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, ChevronDown, ChevronUp, Copy01, Download01, FolderClosed, LayoutLeft, Moon01, Plus, Printer, Sun, X as CloseX } from "@hm/icons";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { ButtonUtility } from "@/components/base/buttons/button-utility";
+import { Button } from "@/components/base/buttons/button";
+import { SearchInput } from "@/components/base/input/search-input";
+import { HellomatikLogo } from "@/components/foundations/logo/hellomatik-logo";
+import { useClipboard } from "@/hooks/use-clipboard";
+import { cx } from "@/utils/cx";
+import { FrontmatterProperties, splitFrontmatter } from "./markdown/frontmatter";
+import { MarkdownRenderer } from "./markdown/markdown-renderer";
+import { dirname, resolvePath } from "./markdown/text-utils";
+import { useDocSearch } from "./markdown/use-doc-search";
+
+interface Doc {
+    path: string;
+    content: string;
+    modified_ms?: number;
+}
+
+interface TocEntry {
+    id: string;
+    text: string;
+    level: number;
+}
+
+const TABS_KEY = "mb:tabs";
+const ACTIVE_KEY = "mb:active-tab";
+const DARK_KEY = "mb:dark";
+const MD_EXT = /\.(md|markdown|mdown|mkd|mdx)$/i;
+
+/** Fuera de Tauri (vite dev en navegador) la app entra en modo preview:
+ *  carga /sample.md por fetch y desactiva las APIs nativas. */
+const IS_TAURI = "__TAURI_INTERNALS__" in window;
+
+function fileTitle(path: string): string {
+    const name = path.split("/").pop() ?? path;
+    return name.replace(MD_EXT, "");
+}
+
+async function readDoc(path: string): Promise<Doc> {
+    if (IS_TAURI) return invoke<Doc>("read_markdown", { path });
+    return { path, content: await fetch(path).then((r) => r.text()) };
+}
+
+export default function App() {
+    const [tabs, setTabs] = useState<Doc[]>([]);
+    const [activePath, setActivePath] = useState<string | null>(null);
+    const [error, setError] = useState<string | null>(null);
+    const [sidebarOpen, setSidebarOpen] = useState(true);
+    const [dark, setDark] = useState(() => {
+        const saved = localStorage.getItem(DARK_KEY);
+        return saved != null ? saved === "1" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    });
+    const [toc, setToc] = useState<TocEntry[]>([]);
+    const [activeId, setActiveId] = useState<string | null>(null);
+    const scrollRef = useRef<HTMLElement>(null);
+    const articleRef = useRef<HTMLElement>(null);
+    const scrollMemory = useRef<Map<string, number>>(new Map());
+    const { copy, copied } = useClipboard();
+
+    const [exportState, setExportState] = useState<"idle" | "busy" | "done">("idle");
+    const searchInputRef = useRef<HTMLInputElement>(null);
+
+    const tabsRef = useRef(tabs);
+    tabsRef.current = tabs;
+    const activeRef = useRef(activePath);
+    activeRef.current = activePath;
+    /** true en cuanto el usuario/SO abre un archivo explícitamente — la
+     *  restauración de sesión ya no debe cambiar la pestaña activa. */
+    const explicitOpenRef = useRef(false);
+
+    const doc = tabs.find((t) => t.path === activePath) ?? null;
+    const frontmatter = doc ? splitFrontmatter(doc.content) : null;
+    const search = useDocSearch(articleRef, doc ? `${doc.path}:${doc.content.length}` : null);
+
+    // ── Abrir/actualizar documento como pestaña ───────────────────────
+    const openDoc = useCallback(async (path: string, opts?: { silent?: boolean; activate?: boolean }) => {
+        const activate = opts?.activate !== false;
+        if (activate) explicitOpenRef.current = true;
+        try {
+            const next = await readDoc(path);
+            setTabs((prev) => {
+                const i = prev.findIndex((t) => t.path === path);
+                if (i >= 0) {
+                    if (prev[i].content === next.content) return prev;
+                    const copy = [...prev];
+                    copy[i] = next;
+                    return copy;
+                }
+                return [...prev, next];
+            });
+            if (activate) setActivePath(path);
+            setError(null);
+        } catch (e) {
+            if (!opts?.silent) setError(String(e));
+        }
+    }, []);
+
+    const closeTab = useCallback((path: string) => {
+        scrollMemory.current.delete(path);
+        setTabs((prev) => {
+            const i = prev.findIndex((t) => t.path === path);
+            const copy = prev.filter((t) => t.path !== path);
+            if (activeRef.current === path) {
+                const fallback = copy[Math.min(i, copy.length - 1)] ?? null;
+                setActivePath(fallback ? fallback.path : null);
+            }
+            return copy;
+        });
+    }, []);
+
+    // ── Arranque: sesión previa + archivo de la asociación ────────────
+    useEffect(() => {
+        let disposed = false;
+        const cleanups: Array<() => void> = [];
+
+        if (!IS_TAURI) {
+            void openDoc("/sample.md");
+            return;
+        }
+
+        // Restaurar sesión (silenciosa: los archivos borrados se descartan)
+        void (async () => {
+            let saved: string[] = [];
+            try {
+                saved = JSON.parse(localStorage.getItem(TABS_KEY) ?? "[]");
+            } catch {
+                /* sesión corrupta: empezar de cero */
+            }
+            for (const path of saved) {
+                if (disposed) return;
+                await openDoc(path, { silent: true, activate: false });
+            }
+            if (!disposed && !explicitOpenRef.current && !activeRef.current) {
+                const last = localStorage.getItem(ACTIVE_KEY);
+                const candidates = tabsRef.current;
+                const target = candidates.find((t) => t.path === last) ?? candidates[0];
+                if (target && !explicitOpenRef.current) setActivePath(target.path);
+            }
+        })();
+
+        // Doble click en Finder con la app ya abierta
+        listen<string>("open-file", (event) => void openDoc(event.payload)).then((unlisten) => cleanups.push(unlisten));
+
+        // Arranque: el RunEvent::Opened de macOS puede llegar antes O después
+        // de que monte el frontend (y el emit puede perderse si aún no hay
+        // listener). Sondeamos el estado Rust durante ~1s.
+        void (async () => {
+            for (let i = 0; i < 8; i++) {
+                if (disposed) return;
+                const opened = await invoke<string | null>("get_opened_file").catch(() => null);
+                if (opened) {
+                    void openDoc(opened);
+                    return;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 125));
+            }
+        })();
+
+        // Drag & drop de un .md sobre la ventana
+        getCurrentWebview()
+            .onDragDropEvent((event) => {
+                if (event.payload.type === "drop") {
+                    for (const p of event.payload.paths.filter((p) => MD_EXT.test(p))) void openDoc(p);
+                }
+            })
+            .then((unlisten) => cleanups.push(unlisten));
+
+        // Releer al volver el foco (el archivo pudo cambiar fuera)
+        const onFocus = () => {
+            const current = activeRef.current;
+            if (current) void openDoc(current, { silent: true });
+        };
+        window.addEventListener("focus", onFocus);
+        cleanups.push(() => window.removeEventListener("focus", onFocus));
+
+        return () => {
+            disposed = true;
+            cleanups.forEach((fn) => fn());
+        };
+    }, [openDoc]);
+
+    // ── Persistir sesión de pestañas ──────────────────────────────────
+    useEffect(() => {
+        if (!IS_TAURI) return;
+        localStorage.setItem(TABS_KEY, JSON.stringify(tabs.map((t) => t.path)));
+        if (activePath) localStorage.setItem(ACTIVE_KEY, activePath);
+    }, [tabs, activePath]);
+
+    // ── Modo claro (hellomatik cálido) / oscuro ───────────────────────
+    useEffect(() => {
+        const root = document.documentElement;
+        root.classList.toggle("dark-mode", dark);
+        root.classList.toggle("hellomatik-mode", !dark);
+        localStorage.setItem(DARK_KEY, dark ? "1" : "0");
+    }, [dark]);
+
+    // ── Título de ventana ─────────────────────────────────────────────
+    useEffect(() => {
+        const title = doc ? `${fileTitle(doc.path)} — Markdown Beauty` : "Markdown Beauty";
+        document.title = title;
+        if (IS_TAURI) void getCurrentWindow().setTitle(title);
+    }, [doc]);
+
+    // ── Memoria de scroll por pestaña ─────────────────────────────────
+    useEffect(() => {
+        const el = scrollRef.current;
+        if (!el || !activePath) return;
+        el.scrollTop = scrollMemory.current.get(activePath) ?? 0;
+        const onScroll = () => scrollMemory.current.set(activePath, el.scrollTop);
+        el.addEventListener("scroll", onScroll, { passive: true });
+        return () => el.removeEventListener("scroll", onScroll);
+    }, [activePath]);
+
+    // ── TOC desde el DOM renderizado (fuente única de verdad) ────────
+    useEffect(() => {
+        const article = articleRef.current;
+        if (!article || !doc) {
+            setToc([]);
+            return;
+        }
+        const headings = Array.from(article.querySelectorAll<HTMLHeadingElement>("h1[id], h2[id], h3[id]")).filter(
+            (h) => !h.closest("[data-footnotes]"),
+        );
+        setToc(
+            headings.map((h) => ({
+                id: h.id,
+                text: h.textContent?.replace(/^#\s*/, "").trim() ?? "",
+                level: Number(h.tagName[1]),
+            })),
+        );
+
+        const observer = new IntersectionObserver(
+            (entries) => {
+                const visible = entries.filter((e) => e.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+                if (visible[0]) setActiveId(visible[0].target.id);
+            },
+            { root: scrollRef.current, rootMargin: "-48px 0px -70% 0px" },
+        );
+        headings.forEach((h) => observer.observe(h));
+        return () => observer.disconnect();
+    }, [doc]);
+
+    // ── Atajos de teclado (Cmd+F búsqueda) ────────────────────────────
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+                e.preventDefault();
+                search.setOpen(true);
+                requestAnimationFrame(() => {
+                    searchInputRef.current?.focus();
+                    searchInputRef.current?.select();
+                });
+            } else if (e.key === "Escape" && search.open) {
+                search.close();
+            }
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+    }, [search.open, search.setOpen, search.close]);
+
+    // ── Exportar PDF directo (sin diálogo de impresión) ───────────────
+    const exportPdf = useCallback(async () => {
+        if (!doc || !IS_TAURI || exportState === "busy") return;
+        const dest = await saveDialog({
+            defaultPath: `${fileTitle(doc.path)}.pdf`,
+            filters: [{ name: "PDF", extensions: ["pdf"] }],
+        });
+        if (!dest) return;
+        setExportState("busy");
+        try {
+            // El sheet del save dialog tiene que desmontarse del todo antes
+            // de anclar la NSPrintOperation modal a la misma ventana.
+            await new Promise((resolve) => setTimeout(resolve, 700));
+            await invoke("export_pdf", { dest });
+            setExportState("done");
+            void revealItemInDir(dest).catch(() => {});
+            setTimeout(() => setExportState("idle"), 2000);
+        } catch (e) {
+            setExportState("idle");
+            setError(String(e));
+        }
+    }, [doc, exportState]);
+
+    const pickFile = useCallback(async () => {
+        const selected = await openDialog({
+            multiple: true,
+            filters: [{ name: "Markdown", extensions: ["md", "markdown", "mdown", "mkd", "mdx"] }],
+        });
+        const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+        for (const p of paths) void openDoc(p);
+    }, [openDoc]);
+
+    const docDir = doc ? dirname(doc.path) : "/";
+
+    return (
+        <div className="flex h-full flex-col bg-primary">
+            {/* ── Barra superior: pestañas ────────────────────────────── */}
+            <header className="titlebar-drag no-print relative z-20 flex h-12 shrink-0 items-center gap-2 border-b border-secondary bg-primary pr-3 pl-[84px]">
+                <div className="titlebar-no-drag flex items-center">
+                    <ButtonUtility
+                        size="xs"
+                        color="tertiary"
+                        icon={LayoutLeft}
+                        tooltip={sidebarOpen ? "Ocultar índice" : "Mostrar índice"}
+                        onClick={() => setSidebarOpen((v) => !v)}
+                    />
+                </div>
+
+                <div className="flex min-w-0 flex-1 items-center gap-1 self-stretch">
+                    {tabs.length > 0 ? (
+                        <>
+                            <div role="tablist" aria-label="Documentos abiertos" className="flex min-w-0 items-center gap-1 overflow-x-auto py-2">
+                                {tabs.map((tab) => {
+                                    const isActive = tab.path === activePath;
+                                    return (
+                                        <span
+                                            key={tab.path}
+                                            role="tab"
+                                            tabIndex={0}
+                                            aria-selected={isActive}
+                                            title={tab.path}
+                                            onClick={() => setActivePath(tab.path)}
+                                            onKeyDown={(e) => {
+                                                if (e.key === "Enter" || e.key === " ") setActivePath(tab.path);
+                                            }}
+                                            onAuxClick={(e) => {
+                                                if (e.button === 1) closeTab(tab.path);
+                                            }}
+                                            className={cx(
+                                                "titlebar-no-drag group/tab flex h-7 max-w-44 shrink-0 cursor-pointer items-center gap-1 rounded-md py-1 pr-1 pl-2.5 text-sm transition-colors duration-100 select-none",
+                                                isActive
+                                                    ? "bg-secondary font-medium text-primary"
+                                                    : "text-tertiary hover:bg-primary_hover hover:text-secondary",
+                                            )}
+                                        >
+                                            <span className="truncate">{fileTitle(tab.path)}</span>
+                                            <span
+                                                role="button"
+                                                tabIndex={-1}
+                                                aria-label={`Cerrar ${fileTitle(tab.path)}`}
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    closeTab(tab.path);
+                                                }}
+                                                className={cx(
+                                                    "rounded-sm p-0.5 text-fg-quaternary transition-opacity duration-100 hover:bg-primary_hover hover:text-fg-quaternary_hover",
+                                                    isActive ? "opacity-100" : "opacity-0 group-hover/tab:opacity-100",
+                                                )}
+                                            >
+                                                <CloseX className="size-3.5" />
+                                            </span>
+                                        </span>
+                                    );
+                                })}
+                            </div>
+                            <div className="titlebar-no-drag shrink-0">
+                                <ButtonUtility size="xs" color="tertiary" icon={Plus} tooltip="Abrir documento…" onClick={() => void pickFile()} />
+                            </div>
+                        </>
+                    ) : (
+                        <span className="px-1 text-sm font-semibold text-quaternary">Markdown Beauty</span>
+                    )}
+                </div>
+
+                <div className="titlebar-no-drag flex items-center gap-1">
+                    {doc && (
+                        <>
+                            <ButtonUtility
+                                size="xs"
+                                color="tertiary"
+                                icon={copied ? Check : Copy01}
+                                tooltip="Copiar markdown"
+                                onClick={() => copy(doc.content)}
+                            />
+                            {IS_TAURI && (
+                                <ButtonUtility
+                                    size="xs"
+                                    color="tertiary"
+                                    icon={exportState === "done" ? Check : Download01}
+                                    isDisabled={exportState === "busy"}
+                                    tooltip="Exportar PDF"
+                                    onClick={() => void exportPdf()}
+                                />
+                            )}
+                            <ButtonUtility
+                                size="xs"
+                                color="tertiary"
+                                icon={Printer}
+                                tooltip="Imprimir"
+                                onClick={() => {
+                                    if (IS_TAURI) invoke("plugin:webview|print").catch(() => window.print());
+                                    else window.print();
+                                }}
+                            />
+                        </>
+                    )}
+                    <ButtonUtility
+                        size="xs"
+                        color="tertiary"
+                        icon={dark ? Sun : Moon01}
+                        tooltip={dark ? "Modo claro" : "Modo oscuro"}
+                        onClick={() => setDark((v) => !v)}
+                    />
+                    {tabs.length === 0 && (
+                        <ButtonUtility size="xs" color="tertiary" icon={FolderClosed} tooltip="Abrir documento…" onClick={() => void pickFile()} />
+                    )}
+                </div>
+            </header>
+
+            <div className="flex min-h-0 flex-1">
+                {/* ── Índice (animado: anchura + fade, sin desmontar) ── */}
+                {(() => {
+                    const showToc = sidebarOpen && !!doc && toc.length > 0;
+                    return (
+                        <div
+                            aria-hidden={!showToc}
+                            className={cx(
+                                "no-print shrink-0 overflow-hidden transition-[width] duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]",
+                                showToc ? "w-60" : "w-0",
+                            )}
+                        >
+                            <nav
+                                className={cx(
+                                    "h-full w-60 overflow-y-auto border-r border-secondary bg-primary py-5 pr-2 pl-3",
+                                    "transition-[opacity,transform] duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]",
+                                    showToc ? "translate-x-0 opacity-100" : "-translate-x-3 opacity-0",
+                                )}
+                            >
+                                <p className="px-2.5 pb-2 text-xs font-semibold text-quaternary">Contenido</p>
+                                <ul className="flex flex-col gap-px">
+                                    {toc.map((entry) => (
+                                        <li key={entry.id}>
+                                            <a
+                                                href={`#${entry.id}`}
+                                                tabIndex={showToc ? 0 : -1}
+                                                className={cx(
+                                                    "block truncate rounded-md py-1 pr-2 text-sm transition-colors duration-100",
+                                                    entry.level === 1 && "pl-2.5 font-medium",
+                                                    entry.level === 2 && "pl-2.5",
+                                                    entry.level === 3 && "pl-6",
+                                                    activeId === entry.id
+                                                        ? "bg-secondary text-primary"
+                                                        : "text-tertiary hover:bg-primary_hover hover:text-secondary",
+                                                )}
+                                            >
+                                                {entry.text}
+                                            </a>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </nav>
+                        </div>
+                    );
+                })()}
+
+                {/* ── Documento ──────────────────────────────────────── */}
+                {/* `relative` es crítico: los elementos sr-only/VisuallyHidden
+                    (checkboxes react-aria, h2 de footnotes) son absolute y sin
+                    ancestro posicionado escapan del clip → scroll infinito a
+                    nivel de página. */}
+                <main ref={scrollRef} className="print-plain relative min-w-0 flex-1 scroll-smooth overflow-y-auto">
+                    {/* ── Barra de búsqueda (Cmd+F) ──────────────────── */}
+                    {search.open && doc && (
+                        <div className="no-print sticky top-3 z-30 float-right mr-5 flex items-center gap-1 rounded-lg border border-secondary bg-primary p-1.5 shadow-lg">
+                            <SearchInput
+                                ref={searchInputRef}
+                                width="sm"
+                                size="sm"
+                                autoFocus
+                                placeholder="Buscar en el documento…"
+                                value={search.query}
+                                onChange={search.setQuery}
+                                onKeyDown={(e: React.KeyboardEvent) => {
+                                    if (e.key === "Enter") search.step(e.shiftKey ? -1 : 1);
+                                }}
+                            />
+                            <span className="min-w-12 text-center text-xs whitespace-nowrap tabular-nums text-quaternary">
+                                {search.total > 0 ? `${search.current + 1}/${search.total}` : "0/0"}
+                            </span>
+                            <ButtonUtility size="xs" color="tertiary" icon={ChevronUp} tooltip="Anterior" onClick={() => search.step(-1)} />
+                            <ButtonUtility size="xs" color="tertiary" icon={ChevronDown} tooltip="Siguiente" onClick={() => search.step(1)} />
+                            <ButtonUtility size="xs" color="tertiary" icon={CloseX} tooltip="Cerrar (Esc)" onClick={search.close} />
+                        </div>
+                    )}
+                    {doc ? (
+                        <article ref={articleRef} key={doc.path} className="mx-auto max-w-[720px] px-10 pt-12 pb-36 max-sm:px-6">
+                            {frontmatter && <FrontmatterProperties data={frontmatter.data} />}
+                            <MarkdownRenderer
+                                content={frontmatter?.body ?? doc.content}
+                                docPath={doc.path}
+                                onOpenExternal={(url) => (IS_TAURI ? void openUrl(url) : window.open(url, "_blank"))}
+                                onOpenDoc={(path) => void openDoc(path)}
+                                toAssetUrl={IS_TAURI ? convertFileSrc : (p) => p}
+                                resolveRelative={(rel) => resolvePath(docDir, rel)}
+                            />
+                        </article>
+                    ) : (
+                        <div className="flex h-full flex-col items-center justify-center gap-7 px-8">
+                            <HellomatikLogo className="text-4xl text-primary" />
+                            <div className="text-center">
+                                <h1 className="text-display-xs text-primary">Markdown Beauty</h1>
+                                <p className="mx-auto mt-2 max-w-xs text-sm leading-relaxed text-tertiary">
+                                    {error ?? "Abre un documento .md o arrástralo a esta ventana para leerlo con calma."}
+                                </p>
+                            </div>
+                            <Button size="md" color="secondary" iconLeading={FolderClosed} onClick={() => void pickFile()}>
+                                Abrir documento…
+                            </Button>
+                        </div>
+                    )}
+                </main>
+            </div>
+        </div>
+    );
+}

@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+vendor/**/node_modules/
+
+# Build output
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/
+.idea/
+
+# Env
+.env
+.env.local
+
+# Claude session memory
+.memsearch/
