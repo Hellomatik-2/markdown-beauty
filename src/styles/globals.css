@@ -219,3 +219,8 @@ mark[data-mb-hit][data-current="true"] {
         break-inside: avoid-page;
     }
 }
+
+/* ─── Terminal del asistente (réplica Moptions/Warp) ──────────────── */
+.font-hack {
+    font-family: "Hack", "JetBrains Mono", ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+}

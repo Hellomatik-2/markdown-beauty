@@ -1,6 +1,6 @@
 [package]
 name = "markdown-beauty"
-version = "1.5.0"
+version = "1.6.0"
 description = "Visor de Markdown precioso con Hellomatik UI"
 authors = ["Hellomatik"]
 edition = "2021"

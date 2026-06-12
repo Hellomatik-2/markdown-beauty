@@ -1,24 +1,32 @@
 /**
- * ChatPanel — el iChat del widget :5174 portado tal cual (PromptInput +
- * Message + MatrixLoader, mismas clases) con dos diferencias de fondo:
- * el "modelo" es un Claude Code sandboxeado al documento activo, y el
- * input autocompleta los slash commands de Claude Code (lista filtrable
- * con ↑↓/Enter/Tab, como el propio CLI).
+ * ChatPanel — réplica del chat-assistant de MOPTIONS: una TERMINAL.
+ *
+ * Como en Warp, cada intercambio es un BLOQUE discreto: tarjeta con
+ * canalón de acento a la izquierda (marca=tú, verde=agente), cabecera
+ * `❯ tú` / `agente` + hora que al hover revela copiar, cuerpo
+ * monoespaciado y plegable. El composer es el prompt: `❯` teal,
+ * textarea mono, divisor gradiente y toolbar con el icono de Claude.
+ *
+ * El "modelo" es Claude Code sandboxeado al documento activo, y al
+ * teclear «/» se autocompletan sus slash commands (↑↓/Enter/Tab).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { MessagePlusSquare } from "@hm/icons";
+import { ArrowUp, Check, ChevronDown, ChevronRight, Copy01, MessagePlusSquare, FolderClosed } from "@hm/icons";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { cx } from "@/utils/cx";
-import { MarkdownRenderer } from "../markdown/markdown-renderer";
-import { MatrixLoader } from "./matrix-loader";
-import { Message, MessageContent } from "./message";
-import { PromptInput, PromptInputSubmit, PromptInputTextarea, PromptInputToolbar, PromptInputTools } from "./prompt-input";
+
+// Paleta Warp dark (el default del terminal de Moptions)
+const TERM_BG = "#181818";
+const TERM_FG = "#d8d8d8";
+const TERM_TEAL = "#7cafc2";
+const TERM_CLAY = "#D97757";
 
 export interface ChatMessage {
     id: string;
     role: "user" | "assistant";
     content: string;
+    timestamp: number;
     error?: boolean;
 }
 
@@ -49,8 +57,7 @@ const genId = () => `m${++nextId}-${performance.now().toFixed(0)}`;
 
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
-/** Preview en navegador (vite dev): comandos y respuestas de muestra
- *  para poder ver/validar la UI sin el backend nativo. */
+/** Preview en navegador (vite dev): datos de muestra para validar la UI. */
 const DEMO_COMMANDS: SlashCommand[] = [
     { name: "compact", description: "Compacta la conversación conservando lo esencial" },
     { name: "cost", description: "Coste y duración de la sesión actual" },
@@ -64,19 +71,99 @@ const DEMO_COMMANDS: SlashCommand[] = [
 const conversationStore = new Map<string, ChatMessage[]>();
 const streamingStore = new Set<string>();
 
-/** TypingDots del widget: MatrixLoader + label (réplica exacta). */
-function TypingDots({ label }: { label?: string }) {
+function formatTime(ts: number): string {
+    return new Date(ts).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
+}
+
+/** Marca "sunburst" de Claude (réplica de foundations/claude-icon de Moptions). */
+function ClaudeIcon({ className }: { className?: string }) {
+    const rays = Array.from({ length: 12 }, (_, i) => i * 30);
     return (
-        <span className="inline-flex items-center gap-1.5" role="status">
-            <MatrixLoader size={16} />
-            <span
-                key={label || "thinking"}
-                className="hm-fade-swap text-sm font-medium"
-                style={{ color: "color-mix(in srgb, var(--color-text-primary) 50%, transparent)" }}
-            >
-                {label || "Pensando…"}
-            </span>
-        </span>
+        <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+            <g stroke="currentColor" strokeWidth="2.1" strokeLinecap="round">
+                {rays.map((deg) => {
+                    const a = (deg * Math.PI) / 180;
+                    return <line key={deg} x1={12 + Math.cos(a) * 3.1} y1={12 + Math.sin(a) * 3.1} x2={12 + Math.cos(a) * 9.3} y2={12 + Math.sin(a) * 9.3} />;
+                })}
+            </g>
+        </svg>
+    );
+}
+
+/** Línea de estado "pensando" (estilo ToolStatusLine de Moptions). */
+function ThinkingLine() {
+    return (
+        <div className="flex items-center gap-2 py-0.5">
+            <span className="size-2 animate-pulse rounded-full bg-utility-brand-500" />
+            <span className="text-[12px] text-[#8E8E93]">pensando…</span>
+        </div>
+    );
+}
+
+/** TerminalBlock — réplica del bloque Warp de Moptions (sin dep motion:
+ *  la entrada usa hm-fade-swap). */
+function TerminalBlock({ message }: { message: ChatMessage }) {
+    const isUser = message.role === "user";
+    const [collapsed, setCollapsed] = useState(false);
+    const [copied, setCopied] = useState(false);
+
+    const hasText = !!message.content;
+    const thinking = !isUser && !hasText;
+
+    function copy() {
+        if (!message.content) return;
+        void navigator.clipboard?.writeText(message.content).then(() => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1200);
+        });
+    }
+
+    return (
+        <div className="group hm-fade-swap relative overflow-hidden rounded-lg border border-white/[0.07] bg-white/[0.02] transition-colors hover:border-white/15 hover:bg-white/[0.04]">
+            {/* Canalón de acento (verde=salida del agente, marca=comando del usuario) */}
+            <span aria-hidden className={cx("absolute top-0 left-0 h-full w-[2px]", isUser ? "bg-brand-solid/70" : "bg-utility-green-500/60")} />
+
+            {/* Cabecera: prompt + hora + (hover) copiar */}
+            <div className="flex items-center justify-between px-3 pt-1.5 pl-3.5">
+                <button
+                    type="button"
+                    onClick={() => setCollapsed((c) => !c)}
+                    className="flex items-center gap-1.5 text-[11px] font-medium text-white/40 transition-colors hover:text-white/75"
+                >
+                    {collapsed ? <ChevronRight className="size-3" /> : <ChevronDown className="size-3" />}
+                    <span className={cx("font-hack", isUser ? "text-[#7cafc2]" : "text-utility-green-400")}>{isUser ? "❯ tú" : "agente"}</span>
+                    <span className="text-white/25 tabular-nums">{formatTime(message.timestamp)}</span>
+                </button>
+
+                {hasText && (
+                    <button
+                        type="button"
+                        onClick={copy}
+                        aria-label="Copiar bloque"
+                        title="Copiar"
+                        className="text-white/40 opacity-0 transition-opacity group-hover:opacity-100 hover:text-white/85"
+                    >
+                        {copied ? <Check className="size-3.5 text-utility-green-400" /> : <Copy01 className="size-3.5" />}
+                    </button>
+                )}
+            </div>
+
+            {/* Cuerpo */}
+            {!collapsed && (
+                <div className="px-3 pt-1 pb-2.5 pl-3.5">
+                    {thinking ? (
+                        <ThinkingLine />
+                    ) : (
+                        <div
+                            className={cx("font-hack text-[13px] leading-[1.55] whitespace-pre-wrap", message.error && "text-error-primary")}
+                            style={message.error ? undefined : { color: TERM_FG }}
+                        >
+                            {message.content}
+                        </div>
+                    )}
+                </div>
+            )}
+        </div>
     );
 }
 
@@ -84,17 +171,18 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
     const [, force] = useState(0);
     const rerender = useCallback(() => force((n) => n + 1), []);
     const [input, setInput] = useState("");
+    const [focused, setFocused] = useState(false);
     const [confirmOpen, setConfirmOpen] = useState(false);
     const [commands, setCommands] = useState<SlashCommand[]>([]);
     const [cmdIndex, setCmdIndex] = useState(0);
     const cmdDismissed = useRef(false);
     const scrollRef = useRef<HTMLDivElement>(null);
-    const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const inputRef = useRef<HTMLTextAreaElement>(null);
 
     const messages = conversationStore.get(docPath) ?? [];
     const isStreaming = streamingStore.has(docPath);
 
-    // ── Slash commands: lista una vez, menú filtrado mientras se teclea ─
+    // ── Slash commands ────────────────────────────────────────────────
     useEffect(() => {
         if (!IS_TAURI) {
             setCommands(DEMO_COMMANDS);
@@ -119,35 +207,8 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
 
     const pickCommand = useCallback((cmd: SlashCommand) => {
         setInput(`/${cmd.name} `);
-        textareaRef.current?.focus();
+        inputRef.current?.focus();
     }, []);
-
-    /** Navegación del menú en fase captura: ↑↓ mueven, Enter/Tab completan
-     *  (sin enviar), Esc lo cierra — antes de que el textarea procese. */
-    const onComposerKeyDownCapture = useCallback(
-        (e: React.KeyboardEvent) => {
-            if (!filteredCommands.length) return;
-            if (e.key === "ArrowDown") {
-                e.preventDefault();
-                e.stopPropagation();
-                setCmdIndex((i) => (i + 1) % filteredCommands.length);
-            } else if (e.key === "ArrowUp") {
-                e.preventDefault();
-                e.stopPropagation();
-                setCmdIndex((i) => (i - 1 + filteredCommands.length) % filteredCommands.length);
-            } else if (e.key === "Enter" || e.key === "Tab") {
-                e.preventDefault();
-                e.stopPropagation();
-                pickCommand(filteredCommands[cmdIndex]);
-            } else if (e.key === "Escape") {
-                e.preventDefault();
-                e.stopPropagation();
-                cmdDismissed.current = true;
-                rerender();
-            }
-        },
-        [filteredCommands, cmdIndex, pickCommand, rerender],
-    );
 
     // ── Stream global: cada evento al bucket de SU documento ──────────
     useEffect(() => {
@@ -180,12 +241,20 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
         if (el) el.scrollTop = el.scrollHeight;
     });
 
+    // Autogrow del textarea (estilo Moptions: min 22px, max 128px)
+    useEffect(() => {
+        const el = inputRef.current;
+        if (!el) return;
+        el.style.height = "auto";
+        if (input) el.style.height = Math.min(el.scrollHeight, 128) + "px";
+    }, [input]);
+
     const sendMessage = useCallback(
         (message: string) => {
             if (!message || streamingStore.has(docPath)) return;
             const bucket = conversationStore.get(docPath) ?? [];
-            bucket.push({ id: genId(), role: "user", content: message });
-            bucket.push({ id: genId(), role: "assistant", content: "" });
+            bucket.push({ id: genId(), role: "user", content: message, timestamp: Date.now() });
+            bucket.push({ id: genId(), role: "assistant", content: "", timestamp: Date.now() });
             conversationStore.set(docPath, bucket);
             streamingStore.add(docPath);
             rerender();
@@ -194,7 +263,7 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
                 setTimeout(() => {
                     const b = conversationStore.get(docPath);
                     const last = b?.[b.length - 1];
-                    if (last?.role === "assistant") last.content = `**Demo** — en la app nativa respondería sobre «${docPath.split("/").pop()}». Has dicho: ${message}`;
+                    if (last?.role === "assistant") last.content = `demo — en la app nativa respondería sobre «${docPath.split("/").pop()}».\nHas dicho: ${message}`;
                     streamingStore.delete(docPath);
                     rerender();
                 }, 1200);
@@ -214,17 +283,52 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
         [docPath, docContent, rerender],
     );
 
-    const handleSubmit = useCallback(
-        (text: string) => {
-            cmdDismissed.current = false;
-            sendMessage(text);
+    const handleSubmit = useCallback(() => {
+        const text = input.trim();
+        if (!text || isStreaming) return;
+        cmdDismissed.current = false;
+        setInput("");
+        sendMessage(text);
+    }, [input, isStreaming, sendMessage]);
+
+    /** Teclas del prompt: primero el menú de comandos (↑↓/Enter/Tab/Esc),
+     *  después Enter envía (Shift+Enter = nueva línea). */
+    const handleKeyDown = useCallback(
+        (e: React.KeyboardEvent) => {
+            if (filteredCommands.length) {
+                if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    setCmdIndex((i) => (i + 1) % filteredCommands.length);
+                    return;
+                }
+                if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setCmdIndex((i) => (i - 1 + filteredCommands.length) % filteredCommands.length);
+                    return;
+                }
+                if (e.key === "Enter" || e.key === "Tab") {
+                    e.preventDefault();
+                    pickCommand(filteredCommands[cmdIndex]);
+                    return;
+                }
+                if (e.key === "Escape") {
+                    e.preventDefault();
+                    cmdDismissed.current = true;
+                    rerender();
+                    return;
+                }
+            }
+            if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                handleSubmit();
+            }
         },
-        [sendMessage],
+        [filteredCommands, cmdIndex, pickCommand, handleSubmit, rerender],
     );
 
-    const handleValueChange = useCallback((next: string) => {
+    const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
         cmdDismissed.current = false;
-        setInput(next);
+        setInput(e.target.value);
     }, []);
 
     const resetConversation = useCallback(() => {
@@ -232,14 +336,14 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
         streamingStore.delete(docPath);
         void invoke("chat_reset", { docPath }).catch(() => {});
         rerender();
-        textareaRef.current?.focus();
+        inputRef.current?.focus();
     }, [docPath, rerender]);
 
     // Hook de test/automatización: MB_CHAT_TEST (+ MB_CHAT_TEST2 tras la
     // primera respuesta, para validar la continuidad --resume).
     const chatTest = useRef<{ ran: boolean; second: string | null; secondSent: boolean }>({ ran: false, second: null, secondSent: false });
     useEffect(() => {
-        if (chatTest.current.ran) return;
+        if (chatTest.current.ran || !IS_TAURI) return;
         chatTest.current.ran = true;
         void invoke<[string | null, string | null]>("get_chat_test")
             .then(([first, second]) => {
@@ -256,25 +360,22 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
         }
     }, [isStreaming, messages.length, sendMessage]);
 
-    const status = isStreaming ? "streaming" : "idle";
-    const lastMsg = messages[messages.length - 1];
-
     return (
-        <div className="flex h-full w-90 flex-col bg-primary">
-            {/* ── Header (réplica WidgetHeader) ───────────────────────── */}
-            <div className="relative flex h-12 shrink-0 items-center justify-between gap-3 border-b border-secondary/60 px-3">
+        <div className="flex h-full w-90 flex-col" style={{ backgroundColor: TERM_BG, color: TERM_FG }}>
+            {/* ── Header de la terminal ───────────────────────────────── */}
+            <div className="relative flex h-12 shrink-0 items-center justify-between gap-3 border-b border-white/[0.07] px-3">
                 <div className="flex min-w-0 flex-1 items-center gap-1.5">
                     <button
                         type="button"
                         onClick={onClose}
                         aria-label="Ocultar asistente"
-                        className="group relative inline-flex size-9 cursor-pointer items-center justify-center rounded-md p-2 text-fg-quaternary outline-focus-ring transition duration-100 ease-linear hover:bg-primary_hover hover:text-fg-quaternary_hover focus-visible:outline-2 focus-visible:outline-offset-2"
+                        className="inline-flex size-9 cursor-pointer items-center justify-center rounded-md p-2 text-white/40 transition-colors duration-150 hover:bg-white/10 hover:text-white/85"
                     >
                         <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="size-5">
                             <path d="m6 17 5-5-5-5m7 10 5-5-5-5" />
                         </svg>
                     </button>
-                    <span className="hm-fade-swap truncate px-1 text-sm font-semibold text-primary">{fileTitle}</span>
+                    <span className="font-hack truncate px-1 text-[13px] font-medium text-white/85">{fileTitle}.md</span>
                 </div>
                 <div className="flex items-center gap-px">
                     {messages.length > 0 && (
@@ -282,28 +383,32 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
                             type="button"
                             onClick={() => setConfirmOpen(true)}
                             aria-label="Nueva conversación"
-                            className="inline-flex size-9 items-center justify-center rounded-md p-2 text-fg-quaternary outline-focus-ring transition-colors duration-150 hover:bg-primary_hover hover:text-fg-quaternary_hover"
+                            className="inline-flex size-9 items-center justify-center rounded-md p-2 text-white/40 transition-colors duration-150 hover:bg-white/10 hover:text-white/85"
                         >
                             <MessagePlusSquare className="size-5" aria-hidden="true" />
                         </button>
                     )}
                 </div>
 
-                {/* Popover de confirmación (réplica WidgetHeader) */}
+                {/* Popover de confirmación (oscuro, terminal) */}
                 {confirmOpen && (
                     <>
                         <div aria-hidden="true" onClick={() => setConfirmOpen(false)} className="fixed inset-0 z-[10050]" />
-                        <div role="alertdialog" className="absolute top-[calc(100%+6px)] right-2 z-[10051] w-72 rounded-xl bg-primary p-3.5 shadow-lg ring-1 ring-secondary">
+                        <div
+                            role="alertdialog"
+                            className="absolute top-[calc(100%+6px)] right-2 z-[10051] w-72 rounded-xl p-3.5 shadow-lg ring-1 ring-white/15"
+                            style={{ backgroundColor: "#1f1f1f" }}
+                        >
                             <div className="flex flex-col gap-3">
                                 <div className="flex flex-col gap-1">
-                                    <p className="text-sm font-semibold text-primary">¿Empezar de nuevo?</p>
-                                    <p className="text-xs text-tertiary">La conversación actual con el documento se descartará.</p>
+                                    <p className="text-sm font-semibold text-white/90">¿Empezar de nuevo?</p>
+                                    <p className="text-xs text-white/50">La conversación actual con el documento se descartará.</p>
                                 </div>
                                 <div className="flex items-center justify-end gap-2">
                                     <button
                                         type="button"
                                         onClick={() => setConfirmOpen(false)}
-                                        className="inline-flex cursor-pointer items-center justify-center rounded-md px-3 py-1.5 text-sm font-semibold text-tertiary outline-focus-ring transition-colors duration-150 hover:bg-primary_hover focus-visible:outline-2 focus-visible:outline-offset-2"
+                                        className="inline-flex cursor-pointer items-center justify-center rounded-md px-3 py-1.5 text-sm font-semibold text-white/55 transition-colors duration-150 hover:bg-white/10"
                                     >
                                         Cancelar
                                     </button>
@@ -313,7 +418,7 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
                                             setConfirmOpen(false);
                                             resetConversation();
                                         }}
-                                        className="inline-flex cursor-pointer items-center justify-center rounded-md bg-brand-solid px-3 py-1.5 text-sm font-semibold text-white outline-focus-ring transition-colors duration-150 hover:bg-brand-solid_hover focus-visible:outline-2 focus-visible:outline-offset-2"
+                                        className="inline-flex cursor-pointer items-center justify-center rounded-md bg-brand-solid px-3 py-1.5 text-sm font-semibold text-white transition-colors duration-150 hover:bg-brand-solid_hover"
                                     >
                                         Empezar nueva
                                     </button>
@@ -324,56 +429,36 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
                 )}
             </div>
 
-            {/* ── Mensajes (réplica iChat: user burbuja, assistant prosa) ── */}
-            <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+            {/* ── Bloques (Warp) ──────────────────────────────────────── */}
+            <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
                 {messages.length === 0 ? (
-                    <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center">
-                        <p className="text-sm font-medium text-secondary">Pregúntale al documento</p>
-                        <p className="text-xs leading-relaxed text-quaternary">
-                            Resúmenes, dudas, "¿dónde dice…?" — el asistente lee «{fileTitle}» y nada más. Escribe <span className="rounded bg-secondary px-1 font-mono">/</span> para los comandos de Claude Code.
+                    <div className="font-hack flex h-full flex-col items-start justify-end gap-1 px-1 pb-2 text-[13px] leading-[1.7]">
+                        <p className="text-white/60">
+                            <span className="text-utility-green-400">agente</span> listo · solo conoce <span className="text-white/85">{fileTitle}.md</span>
+                        </p>
+                        <p className="text-white/35">resúmenes, dudas, "¿dónde dice…?"</p>
+                        <p className="text-white/35">
+                            <span className="text-[#7cafc2]">/</span> para los comandos de Claude Code
                         </p>
                     </div>
                 ) : (
-                    <div className="flex flex-col gap-5">
-                        {messages.map((msg) =>
-                            msg.role === "user" ? (
-                                <Message key={msg.id} from="user">
-                                    <MessageContent variant="filled" className="whitespace-pre-wrap">
-                                        {msg.content}
-                                    </MessageContent>
-                                </Message>
-                            ) : (
-                                <Message key={msg.id} from="assistant">
-                                    <MessageContent variant="flat" className={cx(msg.error && "text-error-primary")}>
-                                        {msg.content === "" ? (
-                                            <TypingDots />
-                                        ) : (
-                                            <div className="chat-markdown min-w-0">
-                                                <MarkdownRenderer
-                                                    content={msg.content}
-                                                    docPath={docPath}
-                                                    onOpenExternal={() => {}}
-                                                    onOpenDoc={() => {}}
-                                                    toAssetUrl={(p) => p}
-                                                    resolveRelative={(p) => p}
-                                                />
-                                            </div>
-                                        )}
-                                    </MessageContent>
-                                </Message>
-                            ),
-                        )}
+                    <div className="flex flex-col gap-2">
+                        {messages.map((msg) => (
+                            <TerminalBlock key={msg.id} message={msg} />
+                        ))}
                     </div>
                 )}
             </div>
 
-            {/* ── Composer (réplica WidgetChatInput) + menú de comandos ── */}
-            <div className="relative shrink-0 p-3 pt-1">
+            {/* ── Composer (prompt de Warp, réplica Moptions) ─────────── */}
+            <footer className="relative shrink-0 p-3 pt-1">
+                {/* Menú de slash commands (terminal) */}
                 {filteredCommands.length > 0 && (
                     <div
                         role="listbox"
                         aria-label="Comandos de Claude Code"
-                        className="absolute right-3 bottom-full left-3 z-30 mb-1.5 max-h-72 overflow-y-auto rounded-xl bg-primary p-1 shadow-lg ring-1 ring-secondary"
+                        className="absolute right-3 bottom-full left-3 z-30 mb-1.5 max-h-72 overflow-y-auto rounded-xl p-1 shadow-lg ring-1 ring-white/15"
+                        style={{ backgroundColor: "#1f1f1f" }}
                     >
                         {filteredCommands.map((cmd, i) => (
                             <button
@@ -384,33 +469,82 @@ export function ChatPanel({ docPath, docContent, fileTitle, onClose }: ChatPanel
                                 onMouseEnter={() => setCmdIndex(i)}
                                 onClick={() => pickCommand(cmd)}
                                 className={cx(
-                                    "flex w-full cursor-pointer items-baseline gap-2.5 rounded-md px-2.5 py-1.5 text-left outline-focus-ring transition-colors duration-100",
-                                    i === cmdIndex ? "bg-primary_hover" : "hover:bg-primary_hover",
+                                    "flex w-full cursor-pointer items-baseline gap-2.5 rounded-md px-2.5 py-1.5 text-left transition-colors duration-100",
+                                    i === cmdIndex ? "bg-white/10" : "hover:bg-white/10",
                                 )}
                             >
-                                <span className="shrink-0 font-mono text-sm font-medium text-primary">/{cmd.name}</span>
-                                <span className="min-w-0 truncate text-xs text-tertiary">{cmd.description}</span>
+                                <span className="font-hack shrink-0 text-[13px] font-medium text-[#7cafc2]">/{cmd.name}</span>
+                                <span className="font-hack min-w-0 truncate text-[11px] text-white/45">{cmd.description}</span>
                             </button>
                         ))}
                     </div>
                 )}
-                <div onKeyDownCapture={onComposerKeyDownCapture}>
-                    <PromptInput status={status} value={input} onValueChange={handleValueChange} onSubmit={handleSubmit}>
-                        <PromptInputTextarea ref={textareaRef} placeholder={`Pregunta sobre ${fileTitle}…`} aria-label="Mensaje para el asistente" />
-                        <PromptInputToolbar>
-                            <PromptInputTools>
-                                <span className="px-1 text-xs text-quaternary select-none">/ comandos</span>
-                            </PromptInputTools>
-                            <PromptInputTools>
-                                <PromptInputSubmit />
-                            </PromptInputTools>
-                        </PromptInputToolbar>
-                    </PromptInput>
-                </div>
-            </div>
 
-            {/* streaming sin contenido aún en doc en segundo plano: nada extra */}
-            {isStreaming && lastMsg?.role !== "assistant" && null}
+                <div className={cx("rounded-xl border transition-colors", focused ? "border-[#7cafc2]/50 bg-white/[0.05]" : "border-white/10 bg-white/[0.035]")}>
+                    {/* Prompt: ❯ + textarea + chip del documento (el "tab" de Warp) */}
+                    <div className="flex items-start gap-2 px-3 pt-2.5">
+                        <span className="font-hack mt-[3px] shrink-0 text-[15px] leading-none text-[#7cafc2] select-none">❯</span>
+                        <textarea
+                            ref={inputRef}
+                            value={input}
+                            onChange={handleChange}
+                            onKeyDown={handleKeyDown}
+                            onFocus={() => setFocused(true)}
+                            onBlur={() => setFocused(false)}
+                            placeholder="Mensaje al agente…"
+                            aria-label="Mensaje para el asistente"
+                            rows={1}
+                            disabled={isStreaming}
+                            className="font-hack max-h-32 min-h-[22px] w-full resize-none bg-transparent text-[14px] leading-[1.45] placeholder:text-white/30 focus:outline-none disabled:opacity-50"
+                            style={{ color: TERM_FG }}
+                        />
+                        <span className="font-hack mt-[1px] shrink-0 rounded-md bg-[#7cafc2]/15 px-2 py-0.5 text-[11px] font-medium text-[#7cafc2]">{fileTitle}.md</span>
+                    </div>
+
+                    {/* Línea de acento teal (como en Warp) */}
+                    <div className="mx-3 mt-2 h-px bg-gradient-to-r from-[#7cafc2]/45 via-[#7cafc2]/12 to-transparent" />
+
+                    {/* Toolbar */}
+                    <div className="flex items-center gap-1 overflow-x-auto px-2 py-2">
+                        <span className="flex size-7 shrink-0 items-center justify-center" title="Claude Code">
+                            <ClaudeIcon className="size-[16px] text-[#D97757]" />
+                        </span>
+
+                        {/* / comandos */}
+                        <button
+                            type="button"
+                            title="Comandos de Claude Code"
+                            onClick={() => {
+                                cmdDismissed.current = false;
+                                setInput("/");
+                                inputRef.current?.focus();
+                            }}
+                            className="font-hack flex h-7 shrink-0 items-center gap-1.5 rounded-md bg-white/[0.03] px-2 text-[12px] text-white/65 ring-1 ring-white/10 transition-colors hover:bg-white/10 hover:text-white/90"
+                        >
+                            <span className="text-[#7cafc2]">/</span> comandos
+                        </button>
+
+                        {/* derecha: cwd + enviar */}
+                        <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
+                            <span className="font-hack hidden h-7 items-center gap-1.5 rounded-md bg-white/[0.03] px-2 text-[12px] text-white/55 ring-1 ring-white/10 md:flex">
+                                <FolderClosed className="size-[14px]" /> ~/{fileTitle}.md
+                            </span>
+                            <button
+                                type="button"
+                                onClick={handleSubmit}
+                                disabled={!input.trim() || isStreaming}
+                                aria-label="Enviar"
+                                className={cx(
+                                    "flex size-7 items-center justify-center rounded-md transition-colors active:scale-90",
+                                    input.trim() && !isStreaming ? "bg-brand-solid text-white" : "bg-white/10 text-white/30",
+                                )}
+                            >
+                                <ArrowUp className="size-[17px]" strokeWidth={2.5} />
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </footer>
         </div>
     );
 }
