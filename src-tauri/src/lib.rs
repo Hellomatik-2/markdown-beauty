@@ -463,10 +463,11 @@ fn find_claude_bin() -> Option<String> {
     .clone()
 }
 
-/// cwd estable y VACÍO para el CLI: sin CLAUDE.md de proyecto ni nada
-/// que contamine el contexto del asistente del documento.
+/// Home estable del asistente (Application Support, NO tmp: la ruta no
+/// cambia nunca → el "trust this folder" de Claude se acepta UNA vez).
 fn chat_home() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("markdown-beauty-chat");
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dir = std::path::PathBuf::from(home).join("Library/Application Support/com.hellomatik.markdown-beauty/chat");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -583,6 +584,156 @@ async fn chat_send(
         }
     });
     Ok(())
+}
+
+// ═══ Terminal del documento: ttyd + Claude Code INTERACTIVO ══════════
+// Réplica del /terminal de Moptions (main.rs start_ttyd): ttyd sirve
+// xterm.js por websocket y cada conexión ejecuta el CLI de claude REAL
+// (TUI completa, con su propio autocompletado de comandos). El prompt
+// del sistema con el documento activo se regenera en chat_set_doc y se
+// inyecta con --append-system-prompt-file; cada nueva sesión lo lee.
+
+static TTYD_CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+/// Puerto elegido en runtime (otros ttyd del sistema pueden ocupar los
+/// típicos 7681/7682 — NUNCA reutilizar uno ajeno: sería otra terminal).
+static TTYD_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+fn port_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+fn chat_workspace() -> std::path::PathBuf {
+    let dir = chat_home().join("workspace");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn find_ttyd(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    if let Ok(res) = app.path().resource_dir() {
+        let p = res.join("vendor/ttyd/ttyd");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // dev: src-tauri/target/release/<exe> → src-tauri/vendor/ttyd/ttyd
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.ancestors().nth(3) {
+            let p = dir.join("vendor/ttyd/ttyd");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Lanza ttyd (idéntico a Moptions: fuente Hack, paleta default_dark de
+/// Warp, persistente). El programa de cada sesión es un wrapper zsh que
+/// ejecuta claude con el prompt del documento activo.
+fn start_ttyd(app: &tauri::AppHandle) {
+    // Primer puerto libre del rango propio (lejos del 7681/7682 de otros)
+    let Some(port) = (7693u16..7710).find(|p| port_free(*p)) else {
+        eprintln!("[ttyd] sin puerto libre");
+        return;
+    };
+    TTYD_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+    let Some(ttyd) = find_ttyd(app) else {
+        eprintln!("[ttyd] binario no encontrado");
+        return;
+    };
+    let Some(claude) = find_claude_bin() else {
+        eprintln!("[ttyd] claude no encontrado");
+        return;
+    };
+    let ws = chat_workspace();
+    let prompt_file = chat_home().join("assistant-prompt.md");
+    if !prompt_file.exists() {
+        let _ = std::fs::write(
+            &prompt_file,
+            "Eres el asistente de Markdown Beauty. Aún no hay documento activo: pide al usuario que abra uno.",
+        );
+    }
+    let launcher = chat_home().join("launch-claude.sh");
+    let script = format!(
+        "#!/bin/zsh\nexec \"{}\" --append-system-prompt-file \"{}\"\n",
+        claude,
+        prompt_file.display()
+    );
+    if std::fs::write(&launcher, script).is_err() {
+        return;
+    }
+    let _ = std::process::Command::new("chmod").arg("+x").arg(&launcher).status();
+
+    let mut cmd = std::process::Command::new(&ttyd);
+    cmd.current_dir(&ws);
+    cmd.arg("--port")
+        .arg(port.to_string())
+        .arg("--interface")
+        .arg("127.0.0.1")
+        .arg("--writable");
+    cmd.arg("-t").arg("fontFamily=Hack, ui-monospace, monospace");
+    cmd.arg("-t").arg("fontSize=13");
+    cmd.arg("-t").arg(r##"theme={"background":"#181818","foreground":"#d8d8d8","cursor":"#7cafc2","selectionBackground":"#3a3a3a","black":"#181818","red":"#ab4642","green":"#a1b56c","yellow":"#f7ca88","blue":"#7cafc2","magenta":"#ba8baf","cyan":"#86c1b9","white":"#d8d8d8","brightBlack":"#585858","brightRed":"#ab4642","brightGreen":"#a1b56c","brightYellow":"#f7ca88","brightBlue":"#7cafc2","brightMagenta":"#ba8baf","brightCyan":"#86c1b9","brightWhite":"#f8f8f8"}"##);
+    cmd.arg("/bin/zsh").arg(&launcher);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    match cmd.spawn() {
+        Ok(child) => {
+            if let Ok(mut guard) = TTYD_CHILD.lock() {
+                *guard = Some(child);
+            }
+        }
+        Err(e) => eprintln!("[ttyd] no se pudo lanzar: {e}"),
+    }
+}
+
+fn stop_ttyd() {
+    if let Ok(mut guard) = TTYD_CHILD.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Regenera el prompt del sistema y la copia local del documento activo.
+/// Las sesiones NUEVAS de la terminal nacen scoped a este documento.
+#[tauri::command]
+fn chat_set_doc(doc_path: String, doc_content: String) -> Result<(), String> {
+    let ws = chat_workspace();
+    let file_name = doc_path.rsplit('/').next().unwrap_or("documento.md").to_string();
+    std::fs::write(ws.join(&file_name), &doc_content).map_err(|e| e.to_string())?;
+
+    let mut content = doc_content;
+    if content.len() > CHAT_DOC_LIMIT {
+        let mut end = CHAT_DOC_LIMIT;
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        content.truncate(end);
+        content.push_str("\n\n[… documento truncado por longitud …]");
+    }
+    let prompt = format!(
+        "Eres el asistente de Markdown Beauty dentro de una terminal Claude Code. \
+         Tu ÚNICO foco es el documento «{file_name}» (ruta original: {doc_path}). \
+         Hay una copia actualizada en ./{file_name} de este directorio de trabajo. \
+         Responde en el idioma del usuario citando las secciones relevantes; si te \
+         preguntan por algo ajeno al documento, decláralo con amabilidad y reconduce. \
+         Contenido actual del documento:\n\n<documento>\n{content}\n</documento>"
+    );
+    std::fs::write(chat_home().join("assistant-prompt.md"), prompt).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// URL de la terminal embebida (puerto elegido en runtime).
+#[tauri::command]
+fn chat_terminal_url() -> Result<String, String> {
+    let port = TTYD_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    if port == 0 {
+        return Err("La terminal no está disponible (ttyd no arrancó)".to_string());
+    }
+    Ok(format!("http://127.0.0.1:{port}/"))
 }
 
 #[derive(Serialize, Clone)]
@@ -730,6 +881,8 @@ pub fn run() {
         )))
         .manage(ChatSessions(Mutex::new(std::collections::HashMap::new())))
         .setup(|app| {
+            // Terminal del documento (ttyd + Claude Code interactivo)
+            start_ttyd(app.handle());
             // Hook de test/automatización: MB_EXPORT_PDF=/ruta/salida.pdf
             // exporta el documento activo a PDF a los 6s de arrancar.
             // Con MB_THEME=dark replica el flujo oscuro completo
@@ -771,12 +924,18 @@ pub fn run() {
             chat_send,
             chat_reset,
             chat_list_commands,
+            chat_set_doc,
+            chat_terminal_url,
             get_chat_test,
             get_test_env
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            // El sidecar ttyd muere con la app
+            if let tauri::RunEvent::Exit = event {
+                stop_ttyd();
+            }
             // macOS: el Finder entrega los archivos asociados con un
             // AppleEvent que Tauri expone como RunEvent::Opened. Puede
             // llegar ANTES de que la webview monte (lanzamiento por doble
