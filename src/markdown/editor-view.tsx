@@ -1,4 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
+import { es } from "@blocknote/core/locales";
+import { invoke } from "@tauri-apps/api/core";
 import { BlockNoteView } from "@blocknote/mantine";
 import { useCreateBlockNote } from "@blocknote/react";
 import "@blocknote/mantine/style.css";
@@ -20,7 +22,7 @@ interface EditorViewProps {
  *  el menú con todos los componentes. Al guardar se serializa a Markdown
  *  real — la vista bonita y el archivo siempre cuentan la misma historia. */
 export const EditorView = forwardRef<EditorHandle, EditorViewProps>(function EditorView({ markdown, dark, onDirty }, ref) {
-    const editor = useCreateBlockNote();
+    const editor = useCreateBlockNote({ dictionary: es });
 
     // Cargar el markdown UNA vez por montaje (el componente se monta con
     // key=doc.path: cambiar de pestaña crea un editor nuevo). La carga
@@ -31,6 +33,17 @@ export const EditorView = forwardRef<EditorHandle, EditorViewProps>(function Edi
         editor.replaceBlocks(editor.document, blocks);
         requestAnimationFrame(() => {
             loadedRef.current = true;
+            // Sonda de test (MB_EDIT_AUTOSAVE_TEST=1): inserta un bloque
+            // como lo haría el usuario y deja que el autosave lo persista.
+            if ("__TAURI_INTERNALS__" in window) {
+                invoke<string | null>("get_test_env", { name: "MB_EDIT_AUTOSAVE_TEST" })
+                    .then((v) => {
+                        if (v !== "1") return;
+                        const last = editor.document[editor.document.length - 1];
+                        if (last) editor.insertBlocks([{ type: "paragraph", content: "AUTOSAVE-PROBE" }], last.id, "after");
+                    })
+                    .catch(() => {});
+            }
         });
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [editor]);

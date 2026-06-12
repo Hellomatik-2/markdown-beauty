@@ -1,10 +1,10 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, ChevronUp, Copy01, Download01, Edit05, FolderClosed, LayoutLeft, Monitor01, Moon01, Plus, Printer, Sun, X as CloseX } from "@hm/icons";
+import { Check, ChevronDown, ChevronUp, Copy01, Download01, Edit05, FolderClosed, LayoutLeft, MessageChatCircle, Monitor01, Moon01, Plus, Printer, Sun, X as CloseX } from "@hm/icons";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { confirm as confirmDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { ButtonUtility } from "@/components/base/buttons/button-utility";
 import { Button } from "@/components/base/buttons/button";
@@ -12,6 +12,7 @@ import { SearchInput } from "@/components/base/input/search-input";
 import { HellomatikLogo } from "@/components/foundations/logo/hellomatik-logo";
 import { useClipboard } from "@/hooks/use-clipboard";
 import { cx } from "@/utils/cx";
+import { ChatPanel } from "./chat/chat-panel";
 import type { EditorHandle } from "./markdown/editor-view";
 import { FrontmatterProperties, splitFrontmatter } from "./markdown/frontmatter";
 import { MarkdownRenderer } from "./markdown/markdown-renderer";
@@ -76,6 +77,7 @@ export default function App() {
     const [activePath, setActivePath] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [sidebarOpen, setSidebarOpen] = useState(true);
+    const [chatOpen, setChatOpen] = useState(() => localStorage.getItem("mb:chat-open") === "1");
     const [themePref, setThemePref] = useState<ThemePref>(loadThemePref);
     const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
     const dark = themePref === "dark" || (themePref === "system" && systemDark);
@@ -90,25 +92,15 @@ export default function App() {
     const searchInputRef = useRef<HTMLInputElement>(null);
 
     // ── Modo edición (WYSIWYG sobre el documento activo) ──────────────
+    // Filosofía Notion: NO hay "guardar". Todo cambio se autoguarda
+    // (debounce 1.2s) y también al salir/cambiar de pestaña/cerrar.
     const [editing, setEditing] = useState(false);
-    const [dirty, setDirty] = useState(false);
+    const [saveState, setSaveState] = useState<"idle" | "dirty" | "saving" | "saved">("idle");
     const editorRef = useRef<EditorHandle>(null);
     const editingRef = useRef(false);
     editingRef.current = editing;
-    const dirtyRef = useRef(false);
-    dirtyRef.current = dirty;
-
-    /** true si se puede abandonar la edición (confirma si hay cambios). */
-    const confirmLeaveEdit = useCallback(async (): Promise<boolean> => {
-        if (!editingRef.current || !dirtyRef.current) return true;
-        const ok = await confirmDialog("Tienes cambios sin guardar. ¿Descartarlos?", {
-            title: "Cambios sin guardar",
-            kind: "warning",
-            okLabel: "Descartar",
-            cancelLabel: "Seguir editando",
-        }).catch(() => false);
-        return ok;
-    }, []);
+    const dirty = saveState === "dirty" || saveState === "saving";
+    const autosaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const tabsRef = useRef(tabs);
     tabsRef.current = tabs;
@@ -126,9 +118,8 @@ export default function App() {
     const openDoc = useCallback(async (path: string, opts?: { silent?: boolean; activate?: boolean }) => {
         const activate = opts?.activate !== false;
         if (activate && path !== activeRef.current && editingRef.current) {
-            if (!(await confirmLeaveEdit())) return;
+            await flushEditsRef.current();
             setEditing(false);
-            setDirty(false);
         }
         if (activate) explicitOpenRef.current = true;
         try {
@@ -148,7 +139,7 @@ export default function App() {
         } catch (e) {
             if (!opts?.silent) setError(String(e));
         }
-    }, [confirmLeaveEdit]);
+    }, []);
 
     /** Abre una mezcla de rutas (archivos .md y/o carpetas): las carpetas
      *  se expanden en el backend a todos sus markdowns (recursivo). */
@@ -170,42 +161,36 @@ export default function App() {
         [openDoc],
     );
 
-    const closeTab = useCallback(
-        (path: string) => {
-            void (async () => {
-                if (path === activeRef.current && !(await confirmLeaveEdit())) return;
-                if (path === activeRef.current) {
-                    setEditing(false);
-                    setDirty(false);
-                }
-                scrollMemory.current.delete(path);
-                setTabs((prev) => {
-                    const i = prev.findIndex((t) => t.path === path);
-                    const copy = prev.filter((t) => t.path !== path);
-                    if (activeRef.current === path) {
-                        const fallback = copy[Math.min(i, copy.length - 1)] ?? null;
-                        setActivePath(fallback ? fallback.path : null);
-                    }
-                    return copy;
-                });
-            })();
-        },
-        [confirmLeaveEdit],
-    );
-
-    /** Activar pestaña respetando la edición en curso (confirma si dirty). */
-    const activateTab = useCallback(
-        (path: string) => {
-            void (async () => {
-                if (path === activeRef.current) return;
-                if (!(await confirmLeaveEdit())) return;
+    const closeTab = useCallback((path: string) => {
+        void (async () => {
+            if (path === activeRef.current && editingRef.current) {
+                await flushEditsRef.current();
                 setEditing(false);
-                setDirty(false);
-                setActivePath(path);
-            })();
-        },
-        [confirmLeaveEdit],
-    );
+            }
+            scrollMemory.current.delete(path);
+            setTabs((prev) => {
+                const i = prev.findIndex((t) => t.path === path);
+                const copy = prev.filter((t) => t.path !== path);
+                if (activeRef.current === path) {
+                    const fallback = copy[Math.min(i, copy.length - 1)] ?? null;
+                    setActivePath(fallback ? fallback.path : null);
+                }
+                return copy;
+            });
+        })();
+    }, []);
+
+    /** Activar pestaña: si había edición en curso, se guarda sola. */
+    const activateTab = useCallback((path: string) => {
+        void (async () => {
+            if (path === activeRef.current) return;
+            if (editingRef.current) {
+                await flushEditsRef.current();
+                setEditing(false);
+            }
+            setActivePath(path);
+        })();
+    }, []);
 
     // ── Arranque: sesión previa + archivo de la asociación ────────────
     useEffect(() => {
@@ -297,6 +282,10 @@ export default function App() {
         localStorage.setItem(THEME_KEY, themePref);
     }, [themePref]);
 
+    useEffect(() => {
+        localStorage.setItem("mb:chat-open", chatOpen ? "1" : "0");
+    }, [chatOpen]);
+
     // Con preferencia "sistema", seguir los cambios de macOS en vivo
     useEffect(() => {
         const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -313,7 +302,26 @@ export default function App() {
                 if (t === "dark" || t === "light" || t === "system") setThemePref(t);
             })
             .catch(() => {});
+        // MB_CHAT_TEST abre el asistente automáticamente
+        invoke<[string | null, string | null]>("get_chat_test")
+            .then(([first]) => {
+                if (first) setChatOpen(true);
+            })
+            .catch(() => {});
     }, []);
+
+    // Hook de test: MB_EDIT_AUTOSAVE_TEST=1 entra a editar al cargar el doc
+    const autoEditRan = useRef(false);
+    useEffect(() => {
+        if (!IS_TAURI || autoEditRan.current || !doc) return;
+        autoEditRan.current = true;
+        invoke<string | null>("get_test_env", { name: "MB_EDIT_AUTOSAVE_TEST" })
+            .then((v) => {
+                if (v === "1") startEditing();
+            })
+            .catch(() => {});
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [doc]);
 
     // ── Título de ventana ─────────────────────────────────────────────
     useEffect(() => {
@@ -366,37 +374,83 @@ export default function App() {
     const saveEdits = useCallback(
         async (exit: boolean) => {
             if (!doc || !editorRef.current) return;
+            if (autosaveTimer.current) {
+                clearTimeout(autosaveTimer.current);
+                autosaveTimer.current = null;
+            }
             try {
+                setSaveState("saving");
                 const body = await editorRef.current.getMarkdown();
                 // El frontmatter no entra al editor: se preserva tal cual
                 const fmLen = doc.content.length - splitFrontmatter(doc.content).body.length;
                 const next = doc.content.slice(0, fmLen) + body;
                 await invoke("write_markdown", { path: doc.path, content: next });
                 setTabs((prev) => prev.map((t) => (t.path === doc.path ? { ...t, content: next } : t)));
-                setDirty(false);
+                setSaveState("saved");
                 if (exit) setEditing(false);
             } catch (e) {
+                setSaveState("dirty");
                 const { message } = await import("@tauri-apps/plugin-dialog");
                 void message(String(e), { title: "No se pudo guardar", kind: "error" }).catch(() => {});
             }
         },
         [doc],
     );
+    const saveEditsRef = useRef(saveEdits);
+    saveEditsRef.current = saveEdits;
+    const saveStateRef = useRef(saveState);
+    saveStateRef.current = saveState;
+
+    /** Guarda lo pendiente (si lo hay) antes de abandonar la edición. */
+    const flushEditsRef = useRef(async () => {});
+    flushEditsRef.current = async () => {
+        if (editingRef.current && (saveStateRef.current === "dirty" || saveStateRef.current === "saving")) {
+            await saveEditsRef.current(false).catch(() => {});
+        }
+    };
+
+    /** Cambio en el editor → autosave con debounce de 1.2s. */
+    const onEditorDirty = useCallback(() => {
+        setSaveState("dirty");
+        if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
+        autosaveTimer.current = setTimeout(() => {
+            autosaveTimer.current = null;
+            void saveEditsRef.current(false);
+        }, 1200);
+    }, []);
+
+    // "Guardado" se desvanece solo
+    useEffect(() => {
+        if (saveState !== "saved") return;
+        const t = setTimeout(() => setSaveState("idle"), 2000);
+        return () => clearTimeout(t);
+    }, [saveState]);
+
+    // Cerrar la ventana con cambios pendientes: guardar y LUEGO cerrar.
+    useEffect(() => {
+        if (!IS_TAURI) return;
+        const un = getCurrentWindow().onCloseRequested(async (event) => {
+            if (editingRef.current && (saveStateRef.current === "dirty" || saveStateRef.current === "saving")) {
+                event.preventDefault();
+                await flushEditsRef.current();
+                void getCurrentWindow().destroy();
+            }
+        });
+        return () => {
+            void un.then((f) => f());
+        };
+    }, []);
 
     const startEditing = useCallback(() => {
         if (!doc) return;
         search.close();
-        setDirty(false);
+        setSaveState("idle");
         setEditing(true);
     }, [doc, search.close]);
 
-    const discardEdits = useCallback(() => {
-        void (async () => {
-            if (!(await confirmLeaveEdit())) return;
-            setEditing(false);
-            setDirty(false);
-        })();
-    }, [confirmLeaveEdit]);
+    const finishEditing = useCallback(() => {
+        void saveEdits(true);
+    }, [saveEdits]);
 
     /** Cmd+O estilo VS Code: un único diálogo nativo que acepta archivos
      *  Markdown y carpetas; el backend expande las carpetas a sus .md. */
@@ -411,26 +465,40 @@ export default function App() {
     // ── Atajos de teclado (Cmd+F búsqueda, Cmd+O abrir) ───────────────
     useEffect(() => {
         const onKey = (e: KeyboardEvent) => {
-            if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && editingRef.current) {
+            const mod = e.metaKey || e.ctrlKey;
+            if (mod && e.key.toLowerCase() === "s" && editingRef.current) {
                 e.preventDefault();
                 void saveEdits(false);
-            } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f" && !editingRef.current) {
+            } else if (mod && !e.ctrlKey && e.key.toLowerCase() === "e") {
+                // ⌘E alterna lectura ↔ edición (al salir se guarda solo)
+                e.preventDefault();
+                if (editingRef.current) void saveEdits(true);
+                else startEditing();
+            } else if (mod && e.key.toLowerCase() === "f" && !editingRef.current) {
                 e.preventDefault();
                 search.setOpen(true);
                 requestAnimationFrame(() => {
                     searchInputRef.current?.focus();
                     searchInputRef.current?.select();
                 });
-            } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
+            } else if (mod && e.key.toLowerCase() === "o") {
                 e.preventDefault();
                 void pickFile();
+            } else if (e.ctrlKey && e.key === "Tab") {
+                // Ctrl+Tab / Ctrl+Shift+Tab: ciclar pestañas como un navegador
+                e.preventDefault();
+                const list = tabsRef.current;
+                if (list.length < 2) return;
+                const i = list.findIndex((t) => t.path === activeRef.current);
+                const next = list[(i + (e.shiftKey ? -1 : 1) + list.length) % list.length];
+                if (next) activateTab(next.path);
             } else if (e.key === "Escape" && search.open) {
                 search.close();
             }
         };
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
-    }, [search.open, search.setOpen, search.close, pickFile, saveEdits]);
+    }, [search.open, search.setOpen, search.close, pickFile, saveEdits, startEditing, activateTab]);
 
     // ── Ventana: arrastrar desde la barra/pestañas + doble clic = zoom ─
     /** El header NO usa -webkit-app-region: drag — WebKit se traga los
@@ -583,14 +651,10 @@ export default function App() {
                 <div className="titlebar-no-drag flex items-center gap-1">
                     {doc && editing && (
                         <>
-                            <ButtonUtility
-                                size="xs"
-                                color="tertiary"
-                                icon={Check}
-                                tooltip={dirty ? "Guardar y terminar (⌘S guarda sin salir)" : "Terminar edición"}
-                                onClick={() => void saveEdits(true)}
-                            />
-                            <ButtonUtility size="xs" color="tertiary" icon={CloseX} tooltip="Descartar cambios" onClick={discardEdits} />
+                            <span aria-live="polite" className="px-1 text-xs whitespace-nowrap text-quaternary tabular-nums">
+                                {saveState === "saving" ? "Guardando…" : saveState === "saved" ? "Guardado" : saveState === "dirty" ? "Sin guardar" : ""}
+                            </span>
+                            <ButtonUtility size="xs" color="tertiary" icon={Check} tooltip="Terminar edición (se guarda solo)" onClick={finishEditing} />
                         </>
                     )}
                     {doc && !editing && (
@@ -624,6 +688,15 @@ export default function App() {
                                 }}
                             />
                         </>
+                    )}
+                    {doc && IS_TAURI && (
+                        <ButtonUtility
+                            size="xs"
+                            color={chatOpen ? "secondary" : "tertiary"}
+                            icon={MessageChatCircle}
+                            tooltip={chatOpen ? "Cerrar asistente" : "Asistente del documento"}
+                            onClick={() => setChatOpen((v) => !v)}
+                        />
                     )}
                     <ButtonUtility
                         size="xs"
@@ -720,7 +793,7 @@ export default function App() {
                                 ref={editorRef}
                                 markdown={frontmatter?.body ?? doc.content}
                                 dark={dark}
-                                onDirty={() => setDirty(true)}
+                                onDirty={onEditorDirty}
                             />
                         </Suspense>
                     ) : doc ? (
@@ -750,6 +823,30 @@ export default function App() {
                         </div>
                     )}
                 </main>
+
+                {/* ── Asistente del documento (panel derecho) ────────── */}
+                {(() => {
+                    const showChat = chatOpen && !!doc && IS_TAURI;
+                    return (
+                        <div
+                            aria-hidden={!showChat}
+                            className={cx(
+                                "no-print shrink-0 overflow-hidden transition-[width] duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]",
+                                showChat ? "w-90" : "w-0",
+                            )}
+                        >
+                            <div
+                                className={cx(
+                                    "h-full w-90 border-l border-secondary",
+                                    "transition-[opacity,transform] duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]",
+                                    showChat ? "translate-x-0 opacity-100" : "translate-x-3 opacity-0",
+                                )}
+                            >
+                                {doc && <ChatPanel docPath={doc.path} docContent={doc.content} fileTitle={fileTitle(doc.path)} />}
+                            </div>
+                        </div>
+                    );
+                })()}
             </div>
         </div>
     );

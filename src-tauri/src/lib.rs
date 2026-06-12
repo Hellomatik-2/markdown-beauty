@@ -425,6 +425,190 @@ fn write_markdown(path: String, content: String) -> Result<(), String> {
     })
 }
 
+// ═══ AI chat del documento ═══════════════════════════════════════════
+// Spawnea el CLI de Claude Code (mismo patrón que el asistente de
+// Moptions: -p + stream-json + --resume) pero SANDBOXEADO al documento:
+// el contenido viaja embebido en el system prompt, sin herramientas ni
+// MCPs. El stream llega al frontend como eventos Tauri "chat-event".
+
+/// session_id de Claude por documento (path → sid). Cada --resume
+/// devuelve un sid NUEVO en el evento result: hay que recapturarlo.
+struct ChatSessions(Mutex<std::collections::HashMap<String, String>>);
+
+/// La app lanzada desde Finder no hereda el PATH del shell: resolver
+/// el binario `claude` una vez vía login shell, con fallbacks típicos.
+fn find_claude_bin() -> Option<String> {
+    static BIN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        if let Ok(out) = std::process::Command::new("/bin/zsh").args(["-lc", "command -v claude"]).output() {
+            if out.status.success() {
+                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !p.is_empty() {
+                    return Some(p);
+                }
+            }
+        }
+        let home = std::env::var("HOME").unwrap_or_default();
+        for cand in [
+            format!("{home}/.local/bin/claude"),
+            "/opt/homebrew/bin/claude".to_string(),
+            "/usr/local/bin/claude".to_string(),
+        ] {
+            if std::path::Path::new(&cand).exists() {
+                return Some(cand);
+            }
+        }
+        None
+    })
+    .clone()
+}
+
+/// cwd estable y VACÍO para el CLI: sin CLAUDE.md de proyecto ni nada
+/// que contamine el contexto del asistente del documento.
+fn chat_home() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("markdown-beauty-chat");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+const CHAT_DOC_LIMIT: usize = 60_000;
+
+#[tauri::command]
+async fn chat_send(
+    app: tauri::AppHandle,
+    state: State<'_, ChatSessions>,
+    doc_path: String,
+    doc_content: String,
+    message: String,
+) -> Result<(), String> {
+    let claude = find_claude_bin().ok_or("No encuentro el CLI de Claude Code. Instálalo (https://claude.com/claude-code) o añádelo al PATH.")?;
+    let resume = state.0.lock().ok().and_then(|m| m.get(&doc_path).cloned());
+
+    let mut content = doc_content;
+    if content.len() > CHAT_DOC_LIMIT {
+        let mut end = CHAT_DOC_LIMIT;
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        content.truncate(end);
+        content.push_str("\n\n[… documento truncado por longitud …]");
+    }
+    let file_name = doc_path.rsplit('/').next().unwrap_or(&doc_path).to_string();
+    let system = format!(
+        "Eres el asistente de lectura de Markdown Beauty para el documento «{file_name}». \
+         Tu ÚNICO conocimiento es el contenido del documento incluido a continuación (siempre en su versión más reciente). \
+         Responde en el idioma del usuario, de forma clara y concisa, citando las secciones relevantes del documento. \
+         Si te preguntan por algo ajeno al documento, decláralo con amabilidad y reconduce la conversación al documento. \
+         No tienes herramientas: no intentes leer archivos, buscar en la web ni ejecutar nada.\n\n\
+         <documento path=\"{doc_path}\">\n{content}\n</documento>"
+    );
+
+    let mut cmd = std::process::Command::new(&claude);
+    cmd.arg("-p")
+        .arg(&message)
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--verbose")
+        .arg("--include-partial-messages")
+        .arg("--append-system-prompt")
+        .arg(&system)
+        .arg("--disallowedTools")
+        .arg("Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Task,NotebookEdit,TodoWrite")
+        .arg("--strict-mcp-config");
+    if let Some(sid) = resume {
+        cmd.arg("--resume").arg(sid);
+    }
+    cmd.current_dir(chat_home())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    let mut child = cmd.spawn().map_err(|e| format!("No se pudo lanzar Claude: {e}"))?;
+    let stdout = child.stdout.take().ok_or("El proceso de Claude no expone stdout")?;
+    let doc_key = doc_path.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::{BufRead, BufReader};
+        use tauri::Emitter;
+        let reader = BufReader::new(stdout);
+        let mut got_delta = false;
+        let mut finished = false;
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let Ok(evt) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            match evt.get("type").and_then(|t| t.as_str()) {
+                Some("stream_event") => {
+                    if let Some(text) = evt.pointer("/event/delta/text").and_then(|d| d.as_str()) {
+                        got_delta = true;
+                        let _ = app.emit("chat-event", serde_json::json!({ "kind": "delta", "docPath": doc_key, "text": text }));
+                    }
+                }
+                Some("system") => {
+                    if let Some(sid) = evt.get("session_id").and_then(|s| s.as_str()) {
+                        if let Some(st) = app.try_state::<ChatSessions>() {
+                            if let Ok(mut m) = st.0.lock() {
+                                m.insert(doc_key.clone(), sid.to_string());
+                            }
+                        }
+                    }
+                }
+                Some("result") => {
+                    if let Some(sid) = evt.get("session_id").and_then(|s| s.as_str()) {
+                        if let Some(st) = app.try_state::<ChatSessions>() {
+                            if let Ok(mut m) = st.0.lock() {
+                                m.insert(doc_key.clone(), sid.to_string());
+                            }
+                        }
+                    }
+                    let is_error = evt.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
+                    // Fallback sin deltas parciales: usar el texto final
+                    if !got_delta {
+                        if let Some(text) = evt.get("result").and_then(|r| r.as_str()) {
+                            let _ = app.emit("chat-event", serde_json::json!({ "kind": "delta", "docPath": doc_key, "text": text }));
+                        }
+                    }
+                    finished = true;
+                    let _ = app.emit("chat-event", serde_json::json!({ "kind": "done", "docPath": doc_key, "isError": is_error }));
+                }
+                _ => {}
+            }
+        }
+        let status = child.wait();
+        if !finished {
+            let detail = match status {
+                Ok(s) if !s.success() => format!("Claude terminó con error ({s})."),
+                _ => "La respuesta se cortó sin terminar.".to_string(),
+            };
+            let _ = app.emit("chat-event", serde_json::json!({ "kind": "error", "docPath": doc_key, "message": detail }));
+        }
+    });
+    Ok(())
+}
+
+/// Hook de test genérico: lee variables de entorno MB_* (solo MB_).
+#[tauri::command]
+fn get_test_env(name: String) -> Option<String> {
+    if !name.starts_with("MB_") {
+        return None;
+    }
+    std::env::var(name).ok()
+}
+
+/// Hooks de test: MB_CHAT_TEST envía esa pregunta al abrir el chat;
+/// MB_CHAT_TEST2 envía una segunda al terminar (valida el --resume).
+#[tauri::command]
+fn get_chat_test() -> (Option<String>, Option<String>) {
+    (std::env::var("MB_CHAT_TEST").ok(), std::env::var("MB_CHAT_TEST2").ok())
+}
+
+/// Empezar de cero la conversación de un documento.
+#[tauri::command]
+fn chat_reset(state: State<'_, ChatSessions>, doc_path: String) {
+    if let Ok(mut m) = state.0.lock() {
+        m.remove(&doc_path);
+    }
+}
+
 #[tauri::command]
 fn read_markdown(path: String) -> Result<MarkdownDoc, String> {
     let content = std::fs::read_to_string(&path).map_err(|e| format!("No se pudo leer «{path}»: {e}"))?;
@@ -450,10 +634,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(OpenedFile(Mutex::new(
             // Hook de test/automatización: MB_OPEN=/ruta/doc.md
             std::env::var("MB_OPEN").ok(),
         )))
+        .manage(ChatSessions(Mutex::new(std::collections::HashMap::new())))
         .setup(|app| {
             // Hook de test/automatización: MB_EXPORT_PDF=/ruta/salida.pdf
             // exporta el documento activo a PDF a los 6s de arrancar.
@@ -492,7 +678,11 @@ pub fn run() {
             export_pdf,
             get_startup_theme,
             expand_markdown_paths,
-            pick_markdown_paths
+            pick_markdown_paths,
+            chat_send,
+            chat_reset,
+            get_chat_test,
+            get_test_env
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
