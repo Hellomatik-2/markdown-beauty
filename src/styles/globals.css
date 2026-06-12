@@ -100,6 +100,18 @@ mark[data-mb-hit][data-current="true"] {
     padding: 0.25rem 0;
 }
 
+/* ─── Editor WYSIWYG (BlockNote) integrado en el lienzo ────────────
+   El editor hereda el lienzo de la app (crema/oscuro) en vez del
+   blanco/negro de su tema: solo se pintan los bloques y menús.       */
+.mb-editor .bn-container {
+    --bn-colors-editor-background: transparent;
+    --bn-colors-editor-text: var(--color-text-primary);
+}
+.mb-editor .bn-editor {
+    background: transparent;
+    font-family: var(--font-body);
+}
+
 /* ─── Ventana Tauri: arrastre por la barra superior ───────────────── */
 @layer utilities {
     .titlebar-drag {

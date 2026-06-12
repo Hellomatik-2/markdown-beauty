@@ -413,6 +413,18 @@ unsafe fn run_open_panel() -> Vec<String> {
     out
 }
 
+/// Guarda el markdown editado. Escritura atómica: tmp + rename para no
+/// dejar el archivo a medias si algo falla.
+#[tauri::command]
+fn write_markdown(path: String, content: String) -> Result<(), String> {
+    let tmp = format!("{path}.mb-tmp");
+    std::fs::write(&tmp, &content).map_err(|e| format!("No se pudo escribir «{path}»: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("No se pudo escribir «{path}»: {e}")
+    })
+}
+
 #[tauri::command]
 fn read_markdown(path: String) -> Result<MarkdownDoc, String> {
     let content = std::fs::read_to_string(&path).map_err(|e| format!("No se pudo leer «{path}»: {e}"))?;
@@ -476,6 +488,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_opened_file,
             read_markdown,
+            write_markdown,
             export_pdf,
             get_startup_theme,
             expand_markdown_paths,

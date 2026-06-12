@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, ChevronUp, Copy01, Download01, FolderClosed, LayoutLeft, Monitor01, Moon01, Plus, Printer, Sun, X as CloseX } from "@hm/icons";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { Check, ChevronDown, ChevronUp, Copy01, Download01, Edit05, FolderClosed, LayoutLeft, Monitor01, Moon01, Plus, Printer, Sun, X as CloseX } from "@hm/icons";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { confirm as confirmDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { ButtonUtility } from "@/components/base/buttons/button-utility";
 import { Button } from "@/components/base/buttons/button";
@@ -12,6 +12,7 @@ import { SearchInput } from "@/components/base/input/search-input";
 import { HellomatikLogo } from "@/components/foundations/logo/hellomatik-logo";
 import { useClipboard } from "@/hooks/use-clipboard";
 import { cx } from "@/utils/cx";
+import type { EditorHandle } from "./markdown/editor-view";
 import { FrontmatterProperties, splitFrontmatter } from "./markdown/frontmatter";
 import { MarkdownRenderer } from "./markdown/markdown-renderer";
 import { dirname, resolvePath } from "./markdown/text-utils";
@@ -57,6 +58,9 @@ function loadThemePref(): ThemePref {
  *  carga /sample.md por fetch y desactiva las APIs nativas. */
 const IS_TAURI = "__TAURI_INTERNALS__" in window;
 
+/** El editor (BlockNote) pesa: cargarlo solo cuando se entra a editar. */
+const EditorView = lazy(() => import("./markdown/editor-view").then((m) => ({ default: m.EditorView })));
+
 function fileTitle(path: string): string {
     const name = path.split("/").pop() ?? path;
     return name.replace(MD_EXT, "");
@@ -85,6 +89,27 @@ export default function App() {
     const [exportState, setExportState] = useState<"idle" | "busy" | "done">("idle");
     const searchInputRef = useRef<HTMLInputElement>(null);
 
+    // ── Modo edición (WYSIWYG sobre el documento activo) ──────────────
+    const [editing, setEditing] = useState(false);
+    const [dirty, setDirty] = useState(false);
+    const editorRef = useRef<EditorHandle>(null);
+    const editingRef = useRef(false);
+    editingRef.current = editing;
+    const dirtyRef = useRef(false);
+    dirtyRef.current = dirty;
+
+    /** true si se puede abandonar la edición (confirma si hay cambios). */
+    const confirmLeaveEdit = useCallback(async (): Promise<boolean> => {
+        if (!editingRef.current || !dirtyRef.current) return true;
+        const ok = await confirmDialog("Tienes cambios sin guardar. ¿Descartarlos?", {
+            title: "Cambios sin guardar",
+            kind: "warning",
+            okLabel: "Descartar",
+            cancelLabel: "Seguir editando",
+        }).catch(() => false);
+        return ok;
+    }, []);
+
     const tabsRef = useRef(tabs);
     tabsRef.current = tabs;
     const activeRef = useRef(activePath);
@@ -100,6 +125,11 @@ export default function App() {
     // ── Abrir/actualizar documento como pestaña ───────────────────────
     const openDoc = useCallback(async (path: string, opts?: { silent?: boolean; activate?: boolean }) => {
         const activate = opts?.activate !== false;
+        if (activate && path !== activeRef.current && editingRef.current) {
+            if (!(await confirmLeaveEdit())) return;
+            setEditing(false);
+            setDirty(false);
+        }
         if (activate) explicitOpenRef.current = true;
         try {
             const next = await readDoc(path);
@@ -118,7 +148,7 @@ export default function App() {
         } catch (e) {
             if (!opts?.silent) setError(String(e));
         }
-    }, []);
+    }, [confirmLeaveEdit]);
 
     /** Abre una mezcla de rutas (archivos .md y/o carpetas): las carpetas
      *  se expanden en el backend a todos sus markdowns (recursivo). */
@@ -140,18 +170,42 @@ export default function App() {
         [openDoc],
     );
 
-    const closeTab = useCallback((path: string) => {
-        scrollMemory.current.delete(path);
-        setTabs((prev) => {
-            const i = prev.findIndex((t) => t.path === path);
-            const copy = prev.filter((t) => t.path !== path);
-            if (activeRef.current === path) {
-                const fallback = copy[Math.min(i, copy.length - 1)] ?? null;
-                setActivePath(fallback ? fallback.path : null);
-            }
-            return copy;
-        });
-    }, []);
+    const closeTab = useCallback(
+        (path: string) => {
+            void (async () => {
+                if (path === activeRef.current && !(await confirmLeaveEdit())) return;
+                if (path === activeRef.current) {
+                    setEditing(false);
+                    setDirty(false);
+                }
+                scrollMemory.current.delete(path);
+                setTabs((prev) => {
+                    const i = prev.findIndex((t) => t.path === path);
+                    const copy = prev.filter((t) => t.path !== path);
+                    if (activeRef.current === path) {
+                        const fallback = copy[Math.min(i, copy.length - 1)] ?? null;
+                        setActivePath(fallback ? fallback.path : null);
+                    }
+                    return copy;
+                });
+            })();
+        },
+        [confirmLeaveEdit],
+    );
+
+    /** Activar pestaña respetando la edición en curso (confirma si dirty). */
+    const activateTab = useCallback(
+        (path: string) => {
+            void (async () => {
+                if (path === activeRef.current) return;
+                if (!(await confirmLeaveEdit())) return;
+                setEditing(false);
+                setDirty(false);
+                setActivePath(path);
+            })();
+        },
+        [confirmLeaveEdit],
+    );
 
     // ── Arranque: sesión previa + archivo de la asociación ────────────
     useEffect(() => {
@@ -209,8 +263,10 @@ export default function App() {
             })
             .then((unlisten) => cleanups.push(unlisten));
 
-        // Releer al volver el foco (el archivo pudo cambiar fuera)
+        // Releer al volver el foco (el archivo pudo cambiar fuera).
+        // NUNCA durante la edición: pisaría el trabajo del usuario.
         const onFocus = () => {
+            if (editingRef.current) return;
             const current = activeRef.current;
             if (current) void openDoc(current, { silent: true });
         };
@@ -261,10 +317,11 @@ export default function App() {
 
     // ── Título de ventana ─────────────────────────────────────────────
     useEffect(() => {
-        const title = doc ? `${fileTitle(doc.path)} — Markdown Beauty` : "Markdown Beauty";
+        const mark = dirty ? "• " : "";
+        const title = doc ? `${mark}${fileTitle(doc.path)} — Markdown Beauty` : "Markdown Beauty";
         document.title = title;
         if (IS_TAURI) void getCurrentWindow().setTitle(title);
-    }, [doc]);
+    }, [doc, dirty]);
 
     // ── Memoria de scroll por pestaña ─────────────────────────────────
     useEffect(() => {
@@ -305,6 +362,42 @@ export default function App() {
         return () => observer.disconnect();
     }, [doc]);
 
+    // ── Guardar la edición: editor → Markdown → disco ─────────────────
+    const saveEdits = useCallback(
+        async (exit: boolean) => {
+            if (!doc || !editorRef.current) return;
+            try {
+                const body = await editorRef.current.getMarkdown();
+                // El frontmatter no entra al editor: se preserva tal cual
+                const fmLen = doc.content.length - splitFrontmatter(doc.content).body.length;
+                const next = doc.content.slice(0, fmLen) + body;
+                await invoke("write_markdown", { path: doc.path, content: next });
+                setTabs((prev) => prev.map((t) => (t.path === doc.path ? { ...t, content: next } : t)));
+                setDirty(false);
+                if (exit) setEditing(false);
+            } catch (e) {
+                const { message } = await import("@tauri-apps/plugin-dialog");
+                void message(String(e), { title: "No se pudo guardar", kind: "error" }).catch(() => {});
+            }
+        },
+        [doc],
+    );
+
+    const startEditing = useCallback(() => {
+        if (!doc) return;
+        search.close();
+        setDirty(false);
+        setEditing(true);
+    }, [doc, search.close]);
+
+    const discardEdits = useCallback(() => {
+        void (async () => {
+            if (!(await confirmLeaveEdit())) return;
+            setEditing(false);
+            setDirty(false);
+        })();
+    }, [confirmLeaveEdit]);
+
     /** Cmd+O estilo VS Code: un único diálogo nativo que acepta archivos
      *  Markdown y carpetas; el backend expande las carpetas a sus .md. */
     const pickFile = useCallback(async () => {
@@ -318,7 +411,10 @@ export default function App() {
     // ── Atajos de teclado (Cmd+F búsqueda, Cmd+O abrir) ───────────────
     useEffect(() => {
         const onKey = (e: KeyboardEvent) => {
-            if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+            if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && editingRef.current) {
+                e.preventDefault();
+                void saveEdits(false);
+            } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f" && !editingRef.current) {
                 e.preventDefault();
                 search.setOpen(true);
                 requestAnimationFrame(() => {
@@ -334,7 +430,7 @@ export default function App() {
         };
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
-    }, [search.open, search.setOpen, search.close, pickFile]);
+    }, [search.open, search.setOpen, search.close, pickFile, saveEdits]);
 
     // ── Ventana: arrastrar desde la barra/pestañas + doble clic = zoom ─
     /** El header NO usa -webkit-app-region: drag — WebKit se traga los
@@ -440,10 +536,10 @@ export default function App() {
                                             tabIndex={0}
                                             aria-selected={isActive}
                                             title={tab.path}
-                                            onClick={() => setActivePath(tab.path)}
+                                            onClick={() => activateTab(tab.path)}
                                             onMouseDown={dragWindowOnMove}
                                             onKeyDown={(e) => {
-                                                if (e.key === "Enter" || e.key === " ") setActivePath(tab.path);
+                                                if (e.key === "Enter" || e.key === " ") activateTab(tab.path);
                                             }}
                                             onAuxClick={(e) => {
                                                 if (e.button === 1) closeTab(tab.path);
@@ -485,8 +581,21 @@ export default function App() {
                 </div>
 
                 <div className="titlebar-no-drag flex items-center gap-1">
-                    {doc && (
+                    {doc && editing && (
                         <>
+                            <ButtonUtility
+                                size="xs"
+                                color="tertiary"
+                                icon={Check}
+                                tooltip={dirty ? "Guardar y terminar (⌘S guarda sin salir)" : "Terminar edición"}
+                                onClick={() => void saveEdits(true)}
+                            />
+                            <ButtonUtility size="xs" color="tertiary" icon={CloseX} tooltip="Descartar cambios" onClick={discardEdits} />
+                        </>
+                    )}
+                    {doc && !editing && (
+                        <>
+                            <ButtonUtility size="xs" color="tertiary" icon={Edit05} tooltip="Editar documento" onClick={startEditing} />
                             <ButtonUtility
                                 size="xs"
                                 color="tertiary"
@@ -532,7 +641,7 @@ export default function App() {
             <div className="flex min-h-0 flex-1">
                 {/* ── Índice (animado: anchura + fade, sin desmontar) ── */}
                 {(() => {
-                    const showToc = sidebarOpen && !!doc && toc.length > 0;
+                    const showToc = sidebarOpen && !!doc && toc.length > 0 && !editing;
                     return (
                         <div
                             aria-hidden={!showToc}
@@ -582,7 +691,7 @@ export default function App() {
                     nivel de página. */}
                 <main ref={scrollRef} className="print-plain relative min-w-0 flex-1 scroll-smooth overflow-y-auto">
                     {/* ── Barra de búsqueda (Cmd+F) ──────────────────── */}
-                    {search.open && doc && (
+                    {search.open && doc && !editing && (
                         <div className="no-print sticky top-3 z-30 float-right mr-5 flex items-center gap-1 rounded-lg border border-secondary bg-primary p-1.5 shadow-lg">
                             <SearchInput
                                 ref={searchInputRef}
@@ -604,7 +713,17 @@ export default function App() {
                             <ButtonUtility size="xs" color="tertiary" icon={CloseX} tooltip="Cerrar (Esc)" onClick={search.close} />
                         </div>
                     )}
-                    {doc ? (
+                    {doc && editing ? (
+                        <Suspense fallback={<div className="mx-auto max-w-[760px] pt-12 text-sm text-quaternary">Cargando editor…</div>}>
+                            <EditorView
+                                key={doc.path}
+                                ref={editorRef}
+                                markdown={frontmatter?.body ?? doc.content}
+                                dark={dark}
+                                onDirty={() => setDirty(true)}
+                            />
+                        </Suspense>
+                    ) : doc ? (
                         <article ref={articleRef} key={doc.path} className="mx-auto max-w-[720px] px-10 pt-12 pb-36 max-sm:px-6">
                             {frontmatter && <FrontmatterProperties data={frontmatter.data} />}
                             <MarkdownRenderer
